@@ -600,17 +600,21 @@ impl GoogleDriveClient {
         Ok(location.to_string())
     }
 
-    /// Uploads a single binary chunk to an active resumable upload session URI.
-    pub async fn upload_resumable_chunk(
+    /// Uploads a binary chunk with an optional total size (using `*` for in-flight streams).
+    pub async fn upload_resumable_chunk_opt(
         &self,
         account_id: &str,
         session_uri: &str,
         chunk: Bytes,
         start_byte: u64,
         end_byte: u64,
-        total_size: u64,
+        total_size: Option<u64>,
     ) -> Result<ChunkUploadResult, VfsError> {
-        let content_range = format!("bytes {start_byte}-{end_byte}/{total_size}");
+        let total_str = match total_size {
+            Some(tot) => tot.to_string(),
+            None => "*".to_string(),
+        };
+        let content_range = format!("bytes {start_byte}-{end_byte}/{total_str}");
         let session_url = session_uri.to_string();
 
         let resp = self
@@ -658,6 +662,27 @@ impl GoogleDriveClient {
                 "Unexpected chunk upload status: {status}"
             )))
         }
+    }
+
+    /// Uploads a single binary chunk to an active resumable upload session URI.
+    pub async fn upload_resumable_chunk(
+        &self,
+        account_id: &str,
+        session_uri: &str,
+        chunk: Bytes,
+        start_byte: u64,
+        end_byte: u64,
+        total_size: u64,
+    ) -> Result<ChunkUploadResult, VfsError> {
+        self.upload_resumable_chunk_opt(
+            account_id,
+            session_uri,
+            chunk,
+            start_byte,
+            end_byte,
+            Some(total_size),
+        )
+        .await
     }
 
     /// Fully hydrates a single account on login: fetches quota, startPageToken, and paginates all files.

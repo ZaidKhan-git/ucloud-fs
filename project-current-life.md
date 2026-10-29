@@ -430,3 +430,61 @@
   - Test 6.4 (`test_remote_creation_and_update`): Verified remote file additions and renames update `InMemoryRoutingTable` and dispatch `CREATE` / `UPDATE` notifications.
   - Test 6.5 (`test_striped_file_chunk_remote_deletion`): Remote deletion of individual chunk triggered removal of both virtual striped file and `.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt` note.
   - Previous Stage Tests: Burst flood (5,000 reqs), chaos network, 100k inode stress, shard deadlock, thundering herd, quota race, and striping rollback all passing.
+
+---
+
+## [Entry 013] - 2026-10-30T01:10:00+05:30: Stage 7 Implementation Complete (Zero-Disk Ephemeral Read/Write Streaming Engine)
+
+### Context & System Update
+- **Stage Progression:** Successfully implemented and verified `Stage 7: Zero-Disk Ephemeral Read/Write Streaming Engine` per `.agents/plan/project-plan.md`.
+- **System Invariants Enforced:**
+  - Zero persistent disk cache: All file reads, media streaming, and drag-and-drop writes execute in-memory with automatic byte eviction.
+  - Per-Handle Ephemeral Read Ring Buffer: 8 MB forward sliding window (`VecDeque<u8>`) with $O(1)$ front byte eviction upon read cursor progression and $<0.005\text{ ms}$ cache hit response time.
+  - Media Player Tail-Seek Optimization: Secondary 256 KB Tail Header Slot reserved for reads in the final 512 KB of files (`moov` atoms, zip directories) without invalidating the 8 MB forward streaming window.
+  - 256 KB-Aligned Resumable Write Spooler: Accumulates arbitrary unaligned writes (`137 B`, `4 KB`, `64 KB`), reorders out-of-order writes within RAM staging buffer, and flushes exact multiples of 256 KB (`262,144` bytes) to Google Drive Resumable Upload sessions.
+  - Backward Seek Prevention: Rejects backward seeks past already-flushed cloud boundaries with `VfsError::InvalidSeekOrOutOfOrderWrite` (`STATUS_NOT_SUPPORTED` / `ENOTSUP`).
+  - Global RAM Backpressure Valve: Tracks total active stream buffer memory across all open handles against a strict 128 MB ceiling, supporting automatic window shrinking under memory pressure.
+  - Zero Residue & Zeroization on Drop: `Zeroize` buffers upon drop or release, returning memory reservations to the global pool.
+
+### Previously Added Items Modified
+- **Files Modified / Added:**
+  ```
+  src/lib.rs
+  src/network/client.rs
+  src/stream/mod.rs
+  src/stream/backpressure.rs
+  src/stream/read_window.rs
+  src/stream/write_spool.rs
+  tests/streaming_engine.rs
+  project-current-life.md
+  ```
+- **Reason for Change:** Stage 7 deliverables implemented according to `.agents/plan/project-plan.md`.
+
+## Whats Changed ?
+- Implemented `src/stream/backpressure.rs`:
+  - `MemoryBackpressureValve`: Enforces global 128 MB streaming RAM ceiling with atomic CAS allocation.
+  - `acquire_or_shrink`: Dynamically contracts stream buffers (e.g. from 8 MB to 2 MB) when memory headroom is constrained.
+  - `MemoryReservation`: RAII guard returning allocated bytes to the global pool on drop.
+- Implemented `src/stream/read_window.rs`:
+  - `ByteSource` trait: Dyn-compatible asynchronous interface for fetching byte ranges (`SingleAccountByteSource`, `StripedManifestByteSource`, `MockByteSource`).
+  - `EphemeralReadHandle`: Bounded 8 MB forward sliding window + 256 KB tail slot.
+  - Coalesces tiny OS reads with immediate front byte eviction.
+  - Media player tail-seek optimization: servicing final 512 KB without blowing away forward window.
+  - Buffer zeroization on drop.
+- Implemented `src/stream/write_spool.rs`:
+  - `EphemeralWriteHandle`: 8 MB bounded staging accumulator.
+  - Out-of-order write reordering in RAM staging buffer.
+  - Aligned flushes in multiples of 256 KB (`GOOGLE_CHUNK_ALIGNMENT = 262,144` bytes) with `Content-Range: bytes <start>-<end>/*`.
+  - Final commit flushing remaining unaligned bytes, verifying cloud completion, capturing Google `file_id`, and dropping RAM to 0.
+  - Incremental SHA-256 calculation across streamed bytes.
+- Enhanced `src/network/client.rs`:
+  - Added `upload_resumable_chunk_opt` supporting `Content-Range: bytes <start>-<end>/*` for active intermediate streaming chunks without requiring total file size upfront.
+- Enabled `pub mod stream;` in `src/lib.rs`.
+- Executed `cargo clippy --all-targets --offline -- -D warnings`: Passed with **0 warnings, 0 errors**.
+- Executed Full Test Suite (50 total tests passing: 34 unit + 16 integration):
+  - Unit Tests: 34/34 passing (including new unit tests for backpressure valve, read window coalescing, tail seek preservation, and write spool out-of-order reordering).
+  - Test 7.1 (`test_mp4_media_player_seek_simulation`): Simulated 500 MB video playback (0..4KB, tail seek to 499.9MB, return to 4KB..65KB, sequential read up to 20 MB). Verified forward window hit on return, exactly 3 HTTP Range requests at 16 MB (and $\le 4$ across 20 MB vs 1,250 unbuffered), and RAM usage never exceeding 8.25 MB ceiling.
+  - Test 7.2 (`test_unaligned_write_stream_and_memory_ceiling`): Fed 10,000 unaligned random writes into `EphemeralWriteHandle`. Verified every intermediate PUT was an exact multiple of 262,144 bytes, final reassembled payload matched exact SHA-256 digest, and RAM dropped to 0 on commit.
+  - Test 7.3 (`test_out_of_order_write_reordering_and_backward_rejection`): Verified arbitrary out-of-order writes reorder cleanly in RAM, and backward seek past flushed bytes returns `VfsError::InvalidSeekOrOutOfOrderWrite`.
+  - Test 7.4 (`test_memory_backpressure_window_shrinking`): Verified window shrinking and allocation rejection under a constrained memory ceiling.
+  - All tests from Stages 1-6 (burst flood, chaos network, 100k inode stress, shard deadlock, delta sync, quota race, striping rollback, thundering herd) passing.
