@@ -9,5 +9,6 @@
 
 pub mod error;
 pub mod network;
+pub mod routing;
 pub mod security;
 pub mod vfs;
