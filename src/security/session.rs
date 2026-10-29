@@ -68,6 +68,12 @@ impl SessionController {
             .ok_or_else(|| VfsError::NotFound(format!("Account {} not found", account_id)))
     }
 
+    /// Returns whether the session is currently active and unlocked.
+    #[must_use]
+    pub fn is_unlocked(&self) -> bool {
+        self.verify_session_active().is_ok()
+    }
+
     /// Checks if the session is currently unlocked and within the strict 10-hour window.
     /// If expired, immediately flips the lock state and purges all memory caches.
     pub fn verify_session_active(&self) -> Result<(), VfsError> {

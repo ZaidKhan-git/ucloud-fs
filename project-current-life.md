@@ -373,3 +373,60 @@
   - Test 5.2 (`tests/striping_rollback.rs`):
     - Path A: 64 MB synthetic file striped into four 16 MB chunks across 3 accounts with manifest and warning note created.
     - Path B: Mid-flight abort at Chunk 3 resulted in transactional rollback deleting Chunks 0..2 from Google Drive and restoring in-flight reservations to 0.
+
+---
+
+## [Entry 012] - 2026-10-30T00:38:00+05:30: Stage 6 Implementation Complete (Real-Time Cloud-to-Local Delta Sync & OS Shell Refresh)
+
+### Context & System Update
+- **Stage Progression:** Successfully implemented and verified `Stage 6: Real-Time Cloud-to-Local Delta Sync (changes.list) & OS Shell Refresh` per `.agents/plan/project-plan.md`.
+- **System Invariants Enforced:**
+  - Real-time cloud reconciliation: Automated background polling loop per linked Google account (active only while `session.is_unlocked() == true`).
+  - Self-echo suppression: 30-second TTL cache (`recent_local_mutations: DashMap<(String, String), Instant>`) preventing local upload/delete operations from causing shell flicker or redundant reconciliations.
+  - Delete-while-reading safety: Open file handles track an `is_unlinked: Arc<AtomicBool>` flag; remote deletions immediately unlink files from directory listings while allowing active streaming readers to terminate cleanly with `VfsError::NotFound` / `STATUS_FILE_DELETED` without panicking.
+  - Cascade striped manifest deletion: Remote deletion of a manifest or any individual chunk automatically removes both the virtual striped file and its companion `.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt` warning note.
+  - Live quota synchronization: Non-empty `changes.list` passes trigger a lightweight `about.get?fields=storageQuota` call to keep account quota usage accurate in RAM.
+  - OS Shell Notifications: Windows Explorer refresh via `windows_sys::Win32::UI::Shell::SHChangeNotify` (`SHCNE_CREATE`, `SHCNE_DELETE`, `SHCNE_UPDATEDIR`).
+
+### Previously Added Items Modified
+- **Files Modified / Added:**
+  ```
+  Cargo.toml
+  src/vfs/notify.rs
+  src/vfs/mod.rs
+  src/routing/sync.rs
+  src/routing/mod.rs
+  src/routing/table.rs
+  src/routing/chunker.rs
+  src/security/session.rs
+  tests/delta_sync.rs
+  project-current-life.md
+  ```
+- **Reason for Change:** Stage 6 deliverables implemented according to `.agents/plan/project-plan.md`.
+
+## Whats Changed ?
+- Implemented `src/vfs/notify.rs`:
+  - `ShellNotifier` trait: Abstract interface for dispatching OS file system directory view refresh events.
+  - `WindowsShellNotifier`: Production Windows Explorer notifier utilizing `SHChangeNotify` with `SHCNF_PATHW | SHCNF_FLUSHNOWAIT`.
+  - `MockShellNotifier`: Thread-safe in-memory notification recorder for unit and integration tests.
+- Implemented `src/routing/sync.rs`:
+  - `DeltaSyncEngine`: Coordinates `changes.list` reconciliation, page token progression, and live quota updates across linked accounts.
+  - Multi-account background polling loop (`spawn_polling_loop`) checking `session.is_unlocked()` on each iteration.
+  - Unlink guard for open handles (`register_open_handle` / `unregister_open_handle`).
+  - 30-second self-echo suppression window (`record_local_mutation`, `is_self_echo`).
+- Enhanced `src/routing/table.rs` & `src/routing/chunker.rs`:
+  - Inode indexation of striped files in `reverse_cloud_index`.
+  - Added `register_chunk_cloud_id` allowing individual chunk cloud IDs to map directly to the parent striped file inode.
+  - Cascading deletion of companion warning notes upon striped file removal.
+- Enhanced `src/security/session.rs`:
+  - Added `pub fn is_unlocked(&self) -> bool` to expose atomic session state.
+- Enabled `Win32_UI_Shell` feature on `windows-sys` in `Cargo.toml`.
+- Executed `cargo clippy --all-targets --offline -- -D warnings`: Passed with **0 warnings, 0 errors**.
+- Executed Full Test Suite (42 total tests passing):
+  - Unit Tests: 30/30 passing.
+  - Test 6.1 (`test_web_ui_deletion_sync`): Reconciled 15 cloud deletions (10 removed, 5 trashed) across 50 files on 3 accounts in $<100\text{ ms}$, verified removal from indices and 15 shell delete notifications.
+  - Test 6.2 (`test_delete_while_reading_race_condition`): Streamed 20 MB virtual file to 8 MB, injected remote deletion mid-stream, verified clean `VfsError::NotFound` without panic or dangling handle memory.
+  - Test 6.3 (`test_self_echo_suppression`): Verified 30-second local mutation cache suppresses redundant shell notifications and deletions.
+  - Test 6.4 (`test_remote_creation_and_update`): Verified remote file additions and renames update `InMemoryRoutingTable` and dispatch `CREATE` / `UPDATE` notifications.
+  - Test 6.5 (`test_striped_file_chunk_remote_deletion`): Remote deletion of individual chunk triggered removal of both virtual striped file and `.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt` note.
+  - Previous Stage Tests: Burst flood (5,000 reqs), chaos network, 100k inode stress, shard deadlock, thundering herd, quota race, and striping rollback all passing.

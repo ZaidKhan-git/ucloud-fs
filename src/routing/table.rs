@@ -198,14 +198,24 @@ impl InMemoryRoutingTable {
         self.lookup_by_name
             .insert((params.parent_ino, canonical_lookup_key(&final_name)), ino);
 
-        // 3. Insert into reverse_cloud_index if single account file
-        if let StorageLocation::SingleAccount {
-            ref account_id,
-            ref google_file_id,
-        } = params.location
-        {
-            self.reverse_cloud_index
-                .insert((account_id.clone(), google_file_id.clone()), ino);
+        // 3. Insert into reverse_cloud_index
+        match &params.location {
+            StorageLocation::SingleAccount {
+                account_id,
+                google_file_id,
+            } => {
+                self.reverse_cloud_index
+                    .insert((account_id.clone(), google_file_id.clone()), ino);
+            }
+            StorageLocation::StripedManifest {
+                manifest_account_id,
+                manifest_google_file_id,
+                ..
+            } => {
+                self.reverse_cloud_index
+                    .insert((manifest_account_id.clone(), manifest_google_file_id.clone()), ino);
+            }
+            StorageLocation::VirtualWarningNote { .. } | StorageLocation::VirtualDirectory => {}
         }
 
         // 4. Register child under parent
@@ -298,6 +308,12 @@ impl InMemoryRoutingTable {
         Some(*guard.value())
     }
 
+    /// Registers a chunk's cloud ID so remote deletion of individual chunks maps to the parent striped file inode.
+    pub fn register_chunk_cloud_id(&self, account_id: &str, google_file_id: &str, striped_ino: u64) {
+        self.reverse_cloud_index
+            .insert((account_id.to_string(), google_file_id.to_string()), striped_ino);
+    }
+
     /// Moves and/or renames an inode from `(old_parent, old_name)` to `(new_parent, new_name)`.
     ///
     /// Follows strict Single-Guard discipline to guarantee freedom from shard deadlocks.
@@ -379,13 +395,23 @@ impl InMemoryRoutingTable {
             .ok_or_else(|| VfsError::NotFound("Inode missing during removal".to_string()))?;
 
         // Cleanup secondary indices
-        if let StorageLocation::SingleAccount {
-            ref account_id,
-            ref google_file_id,
-        } = removed_node.location
-        {
-            self.reverse_cloud_index
-                .remove(&(account_id.clone(), google_file_id.clone()));
+        match &removed_node.location {
+            StorageLocation::SingleAccount {
+                account_id,
+                google_file_id,
+            } => {
+                self.reverse_cloud_index
+                    .remove(&(account_id.clone(), google_file_id.clone()));
+            }
+            StorageLocation::StripedManifest {
+                manifest_account_id,
+                manifest_google_file_id,
+                ..
+            } => {
+                self.reverse_cloud_index
+                    .remove(&(manifest_account_id.clone(), manifest_google_file_id.clone()));
+            }
+            StorageLocation::VirtualWarningNote { .. } | StorageLocation::VirtualDirectory => {}
         }
 
         self.virtual_folders.remove(&target_ino);

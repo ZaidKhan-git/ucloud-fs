@@ -271,6 +271,15 @@ impl OversizedFileChunker {
             web_view_link: None,
         })?;
 
+        // Register each chunk cloud ID to the unified inode
+        for chunk in &uploaded_chunks {
+            self.routing_table.register_chunk_cloud_id(
+                &chunk.account_id,
+                &chunk.google_file_id,
+                unified_ino,
+            );
+        }
+
         // 5. Insert companion warning note into the same directory
         let warning_filename = format!("{}.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt", plan.filename);
         let warning_content = Self::generate_warning_note_content(&plan.filename, &uploaded_chunks);
