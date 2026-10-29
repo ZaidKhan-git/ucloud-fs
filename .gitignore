@@ -1,1 +1,27 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local environment & secret files (Google Cloud OAuth, credentials, session tokens)
+.env
+.env.*
+*.env
+credentials.json
+client_secret*.json
+*.token
+*.enc
+vault.enc
+
+# OS-generated files & noise
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE and Editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

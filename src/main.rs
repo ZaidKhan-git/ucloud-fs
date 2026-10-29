@@ -8,5 +8,5 @@
 
 fn main() {
     tracing_subscriber::fmt::init();
-    tracing::info!("Driveme Unified Cloud VFS daemon initializing...");
+    tracing::info!("ucloud-fs Unified Cloud VFS daemon initializing...");
 }
