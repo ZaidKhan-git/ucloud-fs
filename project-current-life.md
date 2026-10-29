@@ -318,3 +318,58 @@
   - Unit Tests: 27/27 passing (including directory merge, collision resolution, case folding, lazy folder materialization, and rename).
   - Test 4.1 (`tests/inode_stress.rs`): 100,000 synthetic inodes inserted across 5 accounts on 16 concurrent threads in 135 ms; performed 189,183 lookups with **2.032 µs** average latency (limit < 10 µs); verified **20.63 MB** memory footprint (limit < 35 MB); 0 deadlocks.
   - Test 4.2 (`tests/shard_deadlock.rs`): 10,000 rapid concurrent cross-directory moves between folders; verified **0 hangs, 0 deadlocks** (completed in 0.17s).
+
+---
+
+## [Entry 011] - 2026-10-30T00:07:00+05:30: Stage 5 Implementation Complete (Smart Placement Engine, Oversized File Chunker, & Non-Blocking Native Prompt)
+
+### Context & System Update
+- **Stage Progression:** Successfully implemented and verified `Stage 5: Smart Placement Engine, Oversized File Chunker, & Non-Blocking Native Prompt` per `.agents/plan/project-plan.md`.
+- **System Invariants Enforced:**
+  - Three-tier placement resolution: single-account preference, multi-account combined pool striping, and immediate `DiskFull` boundary.
+  - Race-condition-free quota reservations: atomic in-flight write reservations (`reserved_in_flight_bytes`) preventing write collisions across accounts.
+  - Non-blocking OS modal dialogs: `rfd::MessageDialog` offloaded to dedicated OS background thread with a 60-second prompt deduplication cache.
+  - Optimal 16 MB chunk striping (multiples of 256 KB) with companion `.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt` warning note.
+  - Transactional rollback: zero orphaned chunks on network or client abortion.
+
+### Previously Added Items Modified
+- **Files Modified / Added:**
+  ```
+  Cargo.toml
+  Cargo.lock
+  src/vfs/mod.rs
+  src/vfs/prompt.rs
+  src/routing/mod.rs
+  src/routing/placement.rs
+  src/routing/chunker.rs
+  tests/quota_race.rs
+  tests/striping_rollback.rs
+  project-current-life.md
+  ```
+- **Reason for Change:** Stage 5 deliverables implemented according to `.agents/plan/project-plan.md`.
+
+## Whats Changed ?
+- Implemented `src/vfs/prompt.rs`:
+  - `ChunkPrompter` trait: Defines asynchronous prompt interface for asking user permission to split oversized files.
+  - `NativeModalPrompter`: Native OS modal dialog using `rfd::MessageDialog` offloaded to a dedicated OS thread linked via `oneshot` channel so Tokio workers never block.
+  - 60-second Prompt Deduplication Cache: Caches prompt outcomes by file and size to prevent repeated Windows Explorer IRP probes from spamming dialogs.
+  - Headless Prompters: `AutoAcceptPrompter` and `AutoRejectPrompter` for automated environments and tests.
+- Implemented `src/routing/placement.rs`:
+  - `AccountQuota`: Tracks `limit_bytes`, `used_bytes`, and atomic `reserved_in_flight_bytes` with lock-free atomic CAS reservation.
+  - Three-Tier Placement Engine:
+    - Tier 1: Single account selection with largest free space (enforcing 16 MB safety margin).
+    - Tier 2: Multi-account combined pool chunking after user modal approval.
+    - Tier 3: Rejection with `VfsError::DiskFull` when exceeding total pool capacity.
+  - `SingleReservationGuard` & `StripedReservationGuard`: RAII guards automatically releasing in-flight reservations on drop if uncommitted.
+- Implemented `src/routing/chunker.rs`:
+  - `OversizedFileChunker`: Slices oversized files into optimal 16 MB chunks (64 * 256 KB) with per-chunk and overall SHA-256 calculation.
+  - Cloud Manifest: Uploads `<filename>.ucloud_manifest.json` containing chunk index, account ID, Google file ID, byte offsets, and SHA-256 digests.
+  - Dual Inode Creation: Registers virtual striped file (`StorageLocation::StripedManifest`) and required companion warning note (`<filename>.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt`).
+  - Transactional Rollback: Upon mid-flight failure, iterates through uploaded chunks and issues background `files.delete` calls to prevent cloud storage leakage.
+- Executed `cargo clippy --all-targets --offline -- -D warnings`: Passed with **0 warnings, 0 errors**.
+- Executed Stage 5 Stress & Verification Test Suite (37 total tests passing):
+  - Unit Tests: 30/30 passing.
+  - Test 5.1 (`tests/quota_race.rs`): Simultaneous 8 GB uploads fired at the exact same microsecond claimed separate accounts (`Account_A` and `Account_B`) with zero collisions and verified in-flight reservations.
+  - Test 5.2 (`tests/striping_rollback.rs`):
+    - Path A: 64 MB synthetic file striped into four 16 MB chunks across 3 accounts with manifest and warning note created.
+    - Path B: Mid-flight abort at Chunk 3 resulted in transactional rollback deleting Chunks 0..2 from Google Drive and restoring in-flight reservations to 0.

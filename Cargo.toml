@@ -24,6 +24,8 @@ windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foun
 governor = "0.10.4"
 dashmap = "6.2.1"
 bytes = "1.12.1"
+rfd = { version = "0.17.2", default-features = false }
+uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1.12"
