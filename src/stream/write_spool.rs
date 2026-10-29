@@ -38,6 +38,7 @@ pub struct EphemeralWriteHandle {
     flush_threshold: usize,
     reservation: Option<MemoryReservation>,
     is_committed: bool,
+    committed_file_id: Option<String>,
 }
 
 impl EphemeralWriteHandle {
@@ -84,6 +85,7 @@ impl EphemeralWriteHandle {
             flush_threshold,
             reservation: Some(reservation),
             is_committed: false,
+            committed_file_id: None,
         })
     }
 
@@ -169,9 +171,16 @@ impl EphemeralWriteHandle {
             .await?;
 
         match res {
-            ChunkUploadResult::Incomplete { .. } | ChunkUploadResult::Complete { .. } => {
+            ChunkUploadResult::Incomplete { .. } => {
                 self.flushed_bytes += aligned_len as u64;
                 // Zeroize evicted slice before draining to ensure zero residual data in heap
+                self.accumulator[..aligned_len].fill(0);
+                self.accumulator.drain(..aligned_len);
+                Ok(())
+            }
+            ChunkUploadResult::Complete { file_id } => {
+                self.committed_file_id = Some(file_id);
+                self.flushed_bytes += aligned_len as u64;
                 self.accumulator[..aligned_len].fill(0);
                 self.accumulator.drain(..aligned_len);
                 Ok(())
@@ -192,7 +201,7 @@ impl EphemeralWriteHandle {
         let rem_len = self.accumulator.len();
         let total_bytes = self.flushed_bytes + rem_len as u64;
 
-        let file_id = if rem_len > 0 || total_bytes == 0 {
+        let file_id = if rem_len > 0 || (total_bytes == 0 && self.committed_file_id.is_none()) {
             self.sha256_hasher.update(&self.accumulator);
 
             let start_byte = self.flushed_bytes;
@@ -227,6 +236,8 @@ impl EphemeralWriteHandle {
                     ));
                 }
             }
+        } else if let Some(fid) = self.committed_file_id.take() {
+            fid
         } else {
             "completed_empty".to_string()
         };
@@ -273,6 +284,12 @@ impl EphemeralWriteHandle {
     #[must_use]
     pub fn fh(&self) -> u64 {
         self.fh
+    }
+
+    /// Bound Google account ID.
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
     /// Flushed bytes so far.

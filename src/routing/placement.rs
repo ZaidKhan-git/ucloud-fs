@@ -17,7 +17,7 @@ pub const SAFETY_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
 pub struct AccountQuota {
     pub account_id: String,
     pub limit_bytes: u64,
-    pub used_bytes: AtomicU64,
+    pub used_bytes: Arc<AtomicU64>,
     pub reserved_in_flight_bytes: Arc<AtomicU64>,
 }
 
@@ -27,7 +27,7 @@ impl AccountQuota {
         Self {
             account_id,
             limit_bytes,
-            used_bytes: AtomicU64::new(used_bytes),
+            used_bytes: Arc::new(AtomicU64::new(used_bytes)),
             reserved_in_flight_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -77,23 +77,36 @@ pub struct SingleReservationGuard {
     pub account_id: String,
     pub reserved_bytes: u64,
     counter: Arc<AtomicU64>,
+    used_counter: Option<Arc<AtomicU64>>,
     committed: bool,
 }
 
 impl SingleReservationGuard {
     #[must_use]
-    pub fn new(account_id: String, reserved_bytes: u64, counter: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        account_id: String,
+        reserved_bytes: u64,
+        counter: Arc<AtomicU64>,
+        used_counter: Option<Arc<AtomicU64>>,
+    ) -> Self {
         Self {
             account_id,
             reserved_bytes,
             counter,
+            used_counter,
             committed: false,
         }
     }
 
     /// Commits the reservation when an upload finishes successfully.
     pub fn commit(&mut self) {
-        self.committed = true;
+        if !self.committed {
+            self.committed = true;
+            if let Some(used) = &self.used_counter {
+                used.fetch_add(self.reserved_bytes, Ordering::SeqCst);
+            }
+            self.counter.fetch_sub(self.reserved_bytes, Ordering::SeqCst);
+        }
     }
 }
 
@@ -187,7 +200,8 @@ impl PlacementEngine {
     /// Registers or updates an account's quota in RAM.
     pub fn register_account(&self, account_id: &str, limit_bytes: u64, used_bytes: u64) {
         if let Some(existing) = self.accounts.get(account_id) {
-            existing.used_bytes.store(used_bytes, Ordering::Relaxed);
+            existing.used_bytes.store(used_bytes, Ordering::SeqCst);
+            existing.reserved_in_flight_bytes.store(0, Ordering::SeqCst);
             return;
         }
 
@@ -221,6 +235,15 @@ impl PlacementEngine {
         self.accounts
             .iter()
             .map(|entry| entry.value().effective_free_bytes())
+            .sum()
+    }
+
+    /// Returns the combined total capacity limit across all registered accounts.
+    #[must_use]
+    pub fn total_pool_capacity(&self) -> u64 {
+        self.accounts
+            .iter()
+            .map(|entry| entry.value().limit_bytes)
             .sum()
     }
 
@@ -263,6 +286,7 @@ impl PlacementEngine {
                     acc.account_id.clone(),
                     size,
                     Arc::clone(&acc.reserved_in_flight_bytes),
+                    Some(Arc::clone(&acc.used_bytes)),
                 )));
             }
         }
@@ -399,6 +423,7 @@ impl PlacementEngine {
                 acc_id,
                 needed,
                 Arc::clone(&acc.reserved_in_flight_bytes),
+                Some(Arc::clone(&acc.used_bytes)),
             ));
         }
 

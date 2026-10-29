@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -6,6 +8,8 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::error::VfsError;
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Trait for asking user permission to split an oversized file across accounts.
 pub trait ChunkPrompter: Send + Sync {
@@ -18,7 +22,7 @@ pub trait ChunkPrompter: Send + Sync {
         file_size: u64,
         max_single_free: u64,
         total_pool_free: u64,
-    ) -> impl std::future::Future<Output = Result<bool, VfsError>> + Send + 'a;
+    ) -> BoxFuture<'a, Result<bool, VfsError>>;
 }
 
 /// Native OS modal prompt with 60-second deduplication cache.
@@ -59,19 +63,22 @@ impl NativeModalPrompter {
         max_single_free: u64,
         total_pool_free: u64,
     ) -> String {
-        let gb = 1024.0 * 1024.0 * 1024.0;
-        let size_gb = (file_size as f64) / gb;
-        let max_single_gb = (max_single_free as f64) / gb;
-        let total_pool_gb = (total_pool_free as f64) / gb;
+        let size_gb = file_size as f64 / (1024.0 * 1024.0 * 1024.0);
+        let max_single_gb = max_single_free as f64 / (1024.0 * 1024.0 * 1024.0);
+        let total_pool_gb = total_pool_free as f64 / (1024.0 * 1024.0 * 1024.0);
 
         format!(
-            "The file '{}' ({:.2} GB) is larger than the free space on any single Google account \
-            (Max single account free: {:.2} GB), but fits in your combined storage pool ({:.2} GB free). \
-            Do you grant permission to split it into 16 MB chunks across multiple accounts? \
+            "The file '{filename}' ({size_gb:.2} GB) is larger than the free space on any single Google account \
+            (Max single account free: {max_single_gb:.2} GB), but fits in your combined storage pool ({total_pool_gb:.2} GB free).\n\n\
+            Do you grant permission to split it into 16 MB chunks across multiple accounts?\n\n\
             IMPORTANT NOTE: You will NOT be able to open or access this file from the Google Drive web interface \
-            without downloading/copying it out through this unified drive.",
-            filename, size_gb, max_single_gb, total_pool_gb
+            without downloading/copying it out through this unified drive."
         )
+    }
+
+    /// Clears the deduplication cache.
+    pub fn clear_cache(&self) {
+        self.dedup_cache.clear();
     }
 }
 
@@ -82,67 +89,69 @@ impl Default for NativeModalPrompter {
 }
 
 impl ChunkPrompter for NativeModalPrompter {
-    async fn prompt_chunking(
-        &self,
-        filename: &str,
+    fn prompt_chunking<'a>(
+        &'a self,
+        filename: &'a str,
         file_size: u64,
         max_single_free: u64,
         total_pool_free: u64,
-    ) -> Result<bool, VfsError> {
-        let cache_key = format!("{filename}:{file_size}");
+    ) -> BoxFuture<'a, Result<bool, VfsError>> {
+        Box::pin(async move {
+            let cache_key = format!("{filename}:{file_size}");
 
-        // 1. Check deduplication cache
-        {
-            if let Some(entry) = self.dedup_cache.get(&cache_key) {
-                let (cached_decision, timestamp) = *entry.value();
-                if timestamp.elapsed() < self.cache_ttl {
-                    info!(
-                        filename,
-                        cached_decision,
-                        "Reusing recent chunking prompt decision from deduplication cache"
-                    );
-                    return Ok(cached_decision);
+            // 1. Check deduplication cache
+            {
+                if let Some(entry) = self.dedup_cache.get(&cache_key) {
+                    let (cached_decision, timestamp) = *entry.value();
+                    if timestamp.elapsed() < self.cache_ttl {
+                        info!(
+                            filename,
+                            cached_decision,
+                            "Reusing recent chunking prompt decision from deduplication cache"
+                        );
+                        return Ok(cached_decision);
+                    }
                 }
             }
-        }
 
-        let message = Self::format_prompt_message(
-            filename,
-            file_size,
-            max_single_free,
-            total_pool_free,
-        );
+            let message = Self::format_prompt_message(
+                filename,
+                file_size,
+                max_single_free,
+                total_pool_free,
+            );
 
-        // 2. Spawn on a dedicated OS thread linked via oneshot channel to NEVER block Tokio workers
-        let (tx, rx) = oneshot::channel();
-        let fname_owned = filename.to_string();
+            // 2. Spawn on a dedicated OS thread linked via oneshot channel to NEVER block Tokio workers
+            let (tx, rx) = oneshot::channel();
+            let fname_owned = filename.to_string();
 
-        std::thread::spawn(move || {
-            let res = rfd::MessageDialog::new()
-                .set_title("ucloud-fs: Oversized File Split Confirmation")
-                .set_description(&message)
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
+            std::thread::spawn(move || {
+                let res = rfd::MessageDialog::new()
+                    .set_title("ucloud-fs: Oversized File Split Confirmation")
+                    .set_description(&message)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
 
-            let approved = matches!(res, rfd::MessageDialogResult::Yes);
-            let _ = tx.send(approved);
-        });
+                let approved = matches!(res, rfd::MessageDialogResult::Yes);
+                let _ = tx.send(approved);
+            });
 
-        let approved = rx
-            .await
-            .map_err(|_| VfsError::InternalFault("Native dialog thread cancelled".to_string()))?;
+            let approved = rx
+                .await
+                .map_err(|_| VfsError::InternalFault("Native dialog thread cancelled".to_string()))?;
 
-        if approved {
-            info!(filename = %fname_owned, "User approved multi-account file chunking");
-        } else {
-            warn!(filename = %fname_owned, "User rejected multi-account file chunking");
-        }
+            if approved {
+                info!(filename = %fname_owned, "User approved multi-account file chunking");
+            } else {
+                warn!(filename = %fname_owned, "User rejected multi-account file chunking");
+            }
 
-        // 3. Cache the decision with current timestamp
-        self.dedup_cache
-            .insert(cache_key, (approved, Instant::now()));
+            // 3. Cache the decision with current timestamp
+            self.dedup_cache
+                .insert(cache_key, (approved, Instant::now()));
 
-        Ok(approved)
+            Ok(approved)
+        })
     }
 }
 
@@ -151,14 +160,14 @@ impl ChunkPrompter for NativeModalPrompter {
 pub struct AutoAcceptPrompter;
 
 impl ChunkPrompter for AutoAcceptPrompter {
-    async fn prompt_chunking(
-        &self,
-        _filename: &str,
+    fn prompt_chunking<'a>(
+        &'a self,
+        _filename: &'a str,
         _file_size: u64,
         _max_single_free: u64,
         _total_pool_free: u64,
-    ) -> Result<bool, VfsError> {
-        Ok(true)
+    ) -> BoxFuture<'a, Result<bool, VfsError>> {
+        Box::pin(async move { Ok(true) })
     }
 }
 
@@ -167,13 +176,13 @@ impl ChunkPrompter for AutoAcceptPrompter {
 pub struct AutoRejectPrompter;
 
 impl ChunkPrompter for AutoRejectPrompter {
-    async fn prompt_chunking(
-        &self,
-        _filename: &str,
+    fn prompt_chunking<'a>(
+        &'a self,
+        _filename: &'a str,
         _file_size: u64,
         _max_single_free: u64,
         _total_pool_free: u64,
-    ) -> Result<bool, VfsError> {
-        Ok(false)
+    ) -> BoxFuture<'a, Result<bool, VfsError>> {
+        Box::pin(async move { Ok(false) })
     }
 }
