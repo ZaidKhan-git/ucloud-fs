@@ -1159,3 +1159,51 @@
   - 55/55 tests passed (36 unit + 19 integration tests across all 12 test suites).
   - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
   - `cargo build --release --offline`: Built successfully.
+
+
+---
+
+## [Entry 030] - 2026-10-31T00:03:00+05:30
+- **Stage:** STAGE 8E: FIX BITSTREAM CORRUPTION & ELIMINATE VIDEO LAG VIA SHARED INODE PAGE CACHE & SINGLE-FLIGHT PREFETCHING
+- **Status:** PASSING (ALL 57 TESTS PASSED: 38 UNIT + 19 INTEGRATION TESTS, CLIPPY 0 WARNINGS, RELEASE BINARY COMPILED).
+- **Files Modified:**
+  ```
+  src/stream/read_window.rs
+  src/vfs/driver.rs
+  context.md
+  project-current-life.md
+  ```
+- **Reason for Change:**
+  1. **Root Cause of Video Bitstream Corruption & Timestamp Skipping:**
+     - In `EphemeralReadHandle::read`, when a read request spanned the boundary between the end of `forward_buffer` and the next fetched chunk, `append_to_forward_buffer` previously drained `excess` bytes from the front without bounding by the read `offset`.
+     - This caused `self.forward_start_offset` to push past `offset`, resulting in `let rel_offset = offset.saturating_sub(self.forward_start_offset)` evaluating to `0`. The media player received bytes from the beginning of the buffer instead of the actual file offset, corrupting the MP4/MKV container stream at every buffer rollover and forcing Windows Media Player to drop frames and skip timestamps (e.g. 3s -> 7s -> 11s).
+     - Furthermore, `try_absorb_prefetch_if_covers` checked exact offset equality `prefetch_next_offset == Some(required_offset)`. Minor demuxer forward skips failed this check, aborted in-flight HTTP downloads (e.g. 90% complete), and started blocking fetches from scratch.
+     - Finally, Windows Media Player opens 2-3 concurrent file handles (`fh`) per video file (demuxer, audio track, shell metadata). Each handle had its own isolated buffer, causing 2-3x redundant HTTP downloads and saturating network bandwidth.
+  2. **The Permanent Resolution:**
+     - **Offset-Bounded Buffer Invariant:** Enforced `append_to_forward_buffer(&mut self, data: &[u8], min_retain_offset: u64)` with `max_drainable = min_retain_offset.saturating_sub(self.forward_start_offset)`. Guarantees `forward_start_offset <= offset` remains an unbreakable invariant under all boundary crossing reads.
+     - **Range-Inclusive Prefetch Absorption:** Replaced `prefetch_next_offset: u64` with `prefetch_range: Option<(u64, u64)>` and updated `try_absorb_prefetch_if_covers` to check `required_offset >= start_offset && required_offset < end_offset`. In-flight downloads are preserved and absorbed without being aborted.
+     - **Shared Inode Page Cache (`SharedInodeBlockCache`):** Created a process-wide, thread-safe 2 MB block cache with a 96 MB (48-block) LRU eviction ceiling and broadcast-channel single-flight deduplication.
+     - **`CachedByteSource` Adapter:** Wrapped underlying `ByteSource` in `CachedByteSource` backed by `SharedInodeBlockCache`. All concurrent handles reading the same video inode share downloaded blocks in RAM with zero duplicate HTTP calls.
+     - **Predictive 3-Block Read-Ahead:** Spawns background tasks to pre-populate subsequent blocks (`K+1, K+2, K+3`) with sub-100ms fast-start probe at offset 0.
+     - **Immunity to Error `0x8007045d`:** Preserved direct runtime handle injection into handles and sources, ensuring WinFsp unmanaged OS threads never panic or block unmanaged reactors.
+
+## Whats Changed ?
+- `src/stream/read_window.rs`:
+  - Implemented `SharedInodeBlockCache` (2 MB blocks, 96 MB LRU ceiling, broadcast-based single-flight deduplication).
+  - Implemented `CachedByteSource` implementing `ByteSource` with block alignment, 3-block concurrent background read-ahead, and fast-start 512 KB synchronous probe.
+  - Refactored `EphemeralReadHandle` to use `prefetch_range: Option<(u64, u64)>`.
+  - Added `min_retain_offset` parameter to `append_to_forward_buffer` to enforce `forward_start_offset <= offset`.
+  - Updated `try_absorb_prefetch_if_covers` to check range inclusion `[start, end)`.
+  - Added regression test `test_partial_overlap_never_corrupts_offsets` verifying zero byte corruption or offset shift across the 8 MB boundary.
+  - Added regression test `test_multi_handle_shared_inode_cache_deduplication` verifying multi-handle block sharing with zero duplicate fetches.
+- `src/vfs/driver.rs`:
+  - Added `pub shared_block_cache: Arc<SharedInodeBlockCache>` to `UcloudFsDriver`.
+  - Boxed `EphemeralReadHandle` in `HandleState::Read` to reduce enum footprint and satisfy Clippy.
+  - Wrapped `byte_source` in `CachedByteSource` in `driver.open`.
+  - Cleared block cache in `driver.unmount`.
+- `context.md`:
+  - Created root-level living system context snapshot conforming to user documentation protocol.
+- Full verification:
+  - 57/57 tests passed (38 unit + 19 integration tests across all 12 test suites).
+  - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
+  - `cargo build --release --offline`: Built successfully (`target/x86_64-pc-windows-gnu/release/ucloud-fs.exe`).

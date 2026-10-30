@@ -21,8 +21,8 @@ use crate::routing::InMemoryRoutingTable;
 use crate::security::session::SessionController;
 use crate::stream::backpressure::MemoryBackpressureValve;
 use crate::stream::read_window::{
-    ByteSource, EphemeralReadHandle, MockByteSource, SingleAccountByteSource,
-    StripedManifestByteSource,
+    ByteSource, CachedByteSource, EphemeralReadHandle, MockByteSource, SharedInodeBlockCache,
+    SingleAccountByteSource, StripedManifestByteSource,
 };
 use crate::stream::write_spool::EphemeralWriteHandle;
 use crate::vfs::notify::ShellNotifier;
@@ -91,7 +91,7 @@ enum HandleState {
     },
     Read {
         ino: u64,
-        handle: EphemeralReadHandle,
+        handle: Box<EphemeralReadHandle>,
     },
     WritePending(Box<WritePendingState>),
 }
@@ -133,6 +133,7 @@ pub struct UcloudFsDriver {
     account_tokens: DashMap<String, String>,
     mock_files: DashMap<String, Bytes>,
     pub hot_header_cache: DashMap<u64, HotHeaderCacheEntry>,
+    pub shared_block_cache: Arc<SharedInodeBlockCache>,
     is_mounted: AtomicBool,
 }
 
@@ -155,6 +156,7 @@ impl UcloudFsDriver {
             account_tokens: DashMap::new(),
             mock_files: DashMap::new(),
             hot_header_cache: DashMap::new(),
+            shared_block_cache: Arc::new(SharedInodeBlockCache::default()),
             is_mounted: AtomicBool::new(true),
         }
     }
@@ -469,9 +471,16 @@ impl UcloudFsDriver {
                 }
             };
 
+            let cached_source = Arc::new(CachedByteSource::new(
+                ino,
+                byte_source,
+                Arc::clone(&self.shared_block_cache),
+                Some(self.rt_handle.clone()),
+            ));
+
             let mut read_handle = EphemeralReadHandle::with_capacities(
                 self.allocate_fh(),
-                byte_source,
+                cached_source,
                 &self.valve,
                 32 * 1024 * 1024, // 32 MB forward window for continuous stutter-free video streaming
                 512 * 1024,       // 512 KB tail window
@@ -496,7 +505,7 @@ impl UcloudFsDriver {
                 fh,
                 Arc::new(Mutex::new(HandleState::Read {
                     ino,
-                    handle: read_handle,
+                    handle: Box::new(read_handle),
                 })),
             );
 
@@ -1164,9 +1173,9 @@ impl UcloudFsDriver {
         self.execute_vfs_op(None, || {
             if let Some((_, handle_arc)) = self.open_handles.remove(&fh) {
                 if let Ok(state) = handle_arc.try_lock()
-                    && let HandleState::Read { ino, .. } = *state
+                    && let HandleState::Read { ino, .. } = &*state
                 {
-                    self.sync_engine.unregister_open_handle(ino);
+                    self.sync_engine.unregister_open_handle(*ino);
                 }
                 debug!(fh, "Closed and unregistered file handle");
             }
@@ -1179,6 +1188,8 @@ impl UcloudFsDriver {
         info!("Unmounting ucloud-fs VFS driver");
         self.is_mounted.store(false, Ordering::SeqCst);
         self.open_handles.clear();
+        self.shared_block_cache.clear();
+        self.hot_header_cache.clear();
         self.session.lock_and_purge_all_caches();
         Ok(())
     }

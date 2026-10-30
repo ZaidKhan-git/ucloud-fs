@@ -2,7 +2,10 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::error::VfsError;
@@ -175,6 +178,262 @@ impl ByteSource for MockByteSource {
     }
 }
 
+/// Shared Inode Block Cache dividing files into 2 MB blocks with LRU eviction and single-flight deduplication.
+pub struct SharedInodeBlockCache {
+    blocks: DashMap<(u64, u64), (Instant, Bytes)>,
+    in_flight: DashMap<(u64, u64), broadcast::Sender<Bytes>>,
+    max_blocks: usize,
+}
+
+impl Default for SharedInodeBlockCache {
+    fn default() -> Self {
+        Self::new(48) // 48 blocks * 2 MB = 96 MB LRU ceiling
+    }
+}
+
+impl SharedInodeBlockCache {
+    pub const BLOCK_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+
+    #[must_use]
+    pub fn new(max_blocks: usize) -> Self {
+        Self {
+            blocks: DashMap::new(),
+            in_flight: DashMap::new(),
+            max_blocks: max_blocks.max(1),
+        }
+    }
+
+    /// Retrieves a block from cache if present, updating its LRU access timestamp.
+    #[must_use]
+    pub fn get(&self, ino: u64, block_index: u64) -> Option<Bytes> {
+        if let Some(mut entry) = self.blocks.get_mut(&(ino, block_index)) {
+            entry.0 = Instant::now();
+            Some(entry.1.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Inserts a block into cache with LRU eviction when reaching capacity.
+    pub fn insert(&self, ino: u64, block_index: u64, bytes: Bytes) {
+        if self.blocks.contains_key(&(ino, block_index)) {
+            self.blocks.insert((ino, block_index), (Instant::now(), bytes));
+            return;
+        }
+
+        if self.blocks.len() >= self.max_blocks {
+            let oldest_key = self
+                .blocks
+                .iter()
+                .min_by_key(|entry| entry.value().0)
+                .map(|entry| *entry.key());
+
+            if let Some(key) = oldest_key {
+                self.blocks.remove(&key);
+            }
+        }
+
+        self.blocks.insert((ino, block_index), (Instant::now(), bytes));
+    }
+
+    /// Gets a block from cache or fetches it with single-flight deduplication across handles.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        ino: u64,
+        block_index: u64,
+        fetch_fut: F,
+    ) -> Result<Bytes, VfsError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Bytes, VfsError>>,
+    {
+        if let Some(bytes) = self.get(ino, block_index) {
+            return Ok(bytes);
+        }
+
+        enum FlightStatus {
+            Leader(broadcast::Sender<Bytes>),
+            Follower(broadcast::Receiver<Bytes>),
+        }
+
+        let flight_status = {
+            use dashmap::mapref::entry::Entry;
+            match self.in_flight.entry((ino, block_index)) {
+                Entry::Occupied(occ) => FlightStatus::Follower(occ.get().subscribe()),
+                Entry::Vacant(vac) => {
+                    let (tx, _) = broadcast::channel(1);
+                    vac.insert(tx.clone());
+                    FlightStatus::Leader(tx)
+                }
+            }
+        };
+
+        match flight_status {
+            FlightStatus::Follower(mut rx) => match rx.recv().await {
+                Ok(bytes) => Ok(bytes),
+                Err(_) => {
+                    if let Some(bytes) = self.get(ino, block_index) {
+                        Ok(bytes)
+                    } else {
+                        let bytes = fetch_fut().await?;
+                        self.insert(ino, block_index, bytes.clone());
+                        Ok(bytes)
+                    }
+                }
+            },
+            FlightStatus::Leader(tx) => {
+                let res = fetch_fut().await;
+                self.in_flight.remove(&(ino, block_index));
+                match res {
+                    Ok(bytes) => {
+                        self.insert(ino, block_index, bytes.clone());
+                        let _ = tx.send(bytes.clone());
+                        Ok(bytes)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    /// Clears all cached blocks and in-flight tracking.
+    pub fn clear(&self) {
+        self.blocks.clear();
+        self.in_flight.clear();
+    }
+
+    /// Number of cached blocks currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Returns whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Cached byte source wrapping an inner `ByteSource` with 2 MB block alignment,
+/// shared inode caching, and 3-block concurrent background read-ahead.
+pub struct CachedByteSource {
+    ino: u64,
+    inner: Arc<dyn ByteSource>,
+    cache: Arc<SharedInodeBlockCache>,
+    rt_handle: Option<tokio::runtime::Handle>,
+}
+
+impl CachedByteSource {
+    #[must_use]
+    pub fn new(
+        ino: u64,
+        inner: Arc<dyn ByteSource>,
+        cache: Arc<SharedInodeBlockCache>,
+        rt_handle: Option<tokio::runtime::Handle>,
+    ) -> Self {
+        Self {
+            ino,
+            inner,
+            cache,
+            rt_handle,
+        }
+    }
+
+    /// Spawns background tasks to ensure subsequent blocks (K+1, K+2, K+3) are pre-populated.
+    fn trigger_multi_block_read_ahead(&self, start_block: u64, count: u64) {
+        let Some(rt) = &self.rt_handle else {
+            return;
+        };
+        let block_size = SharedInodeBlockCache::BLOCK_SIZE as u64;
+        let file_size = self.inner.file_size();
+
+        for i in 0..count {
+            let b = start_block + i;
+            let b_start = b * block_size;
+            if b_start >= file_size {
+                break;
+            }
+            if self.cache.get(self.ino, b).is_some() {
+                continue;
+            }
+
+            let b_end = ((b + 1) * block_size).min(file_size).saturating_sub(1);
+            let inner = Arc::clone(&self.inner);
+            let cache = Arc::clone(&self.cache);
+            let ino = self.ino;
+
+            let fut = async move {
+                let _ = cache
+                    .get_or_fetch(ino, b, move || async move {
+                        inner.fetch_range(b_start, b_end).await
+                    })
+                    .await;
+            };
+
+            rt.spawn(fut);
+        }
+    }
+}
+
+impl ByteSource for CachedByteSource {
+    fn file_size(&self) -> u64 {
+        self.inner.file_size()
+    }
+
+    fn fetch_range<'a>(&'a self, start: u64, end: u64) -> BoxFuture<'a, Result<Bytes, VfsError>> {
+        Box::pin(async move {
+            let file_size = self.file_size();
+            if start > end || start >= file_size {
+                return Ok(Bytes::new());
+            }
+            let end = end.min(file_size.saturating_sub(1));
+
+            let block_size = SharedInodeBlockCache::BLOCK_SIZE as u64;
+            let start_block = start / block_size;
+            let end_block = end / block_size;
+
+            // Fast-start optimization: On first probe at offset < 512 KB,
+            // fetch 512 KB directly for sub-100ms startup and asynchronously warm blocks 0, 1, 2!
+            if start == 0 && (end + 1) <= 512 * 1024 && self.cache.get(self.ino, 0).is_none() {
+                let fast_bytes = self.inner.fetch_range(start, end).await?;
+                self.trigger_multi_block_read_ahead(0, 3);
+                return Ok(fast_bytes);
+            }
+
+            let mut assembled = Vec::with_capacity((end - start + 1) as usize);
+
+            for b in start_block..=end_block {
+                let b_start = b * block_size;
+                let b_end = ((b + 1) * block_size).min(file_size).saturating_sub(1);
+
+                let inner = Arc::clone(&self.inner);
+                let block_bytes = self
+                    .cache
+                    .get_or_fetch(self.ino, b, move || async move {
+                        inner.fetch_range(b_start, b_end).await
+                    })
+                    .await?;
+
+                let overlap_start = start.max(b_start);
+                let overlap_end = end.min(b_end);
+
+                let rel_start = (overlap_start - b_start) as usize;
+                let rel_end = (overlap_end - b_start + 1) as usize;
+
+                if rel_start < block_bytes.len() {
+                    let slice_end = rel_end.min(block_bytes.len());
+                    assembled.extend_from_slice(&block_bytes[rel_start..slice_end]);
+                }
+            }
+
+            self.trigger_multi_block_read_ahead(end_block + 1, 3);
+
+            Ok(Bytes::from(assembled))
+        })
+    }
+}
+
 /// Per-Handle Ephemeral Read Ring Buffer with Media Player Tail-Seek Optimization.
 pub struct EphemeralReadHandle {
     fh: u64,
@@ -189,7 +448,7 @@ pub struct EphemeralReadHandle {
     reservation: Option<MemoryReservation>,
     enable_prefetch: bool,
     prefetch_task: Option<tokio::task::JoinHandle<Result<Bytes, VfsError>>>,
-    prefetch_next_offset: u64,
+    prefetch_range: Option<(u64, u64)>,
     sequential_hit_streak: u32,
     enable_progressive: bool,
     last_read_end: u64,
@@ -257,7 +516,7 @@ impl EphemeralReadHandle {
             reservation: Some(reservation),
             enable_prefetch: false,
             prefetch_task: None,
-            prefetch_next_offset: 0,
+            prefetch_range: None,
             sequential_hit_streak: 0,
             enable_progressive: false,
             last_read_end: 0,
@@ -309,12 +568,94 @@ impl EphemeralReadHandle {
                     if prefetch_len > 0 {
                         let prefetch_end = (forward_end + prefetch_len).saturating_sub(1);
                         let source = Arc::clone(&self.source);
-                        self.prefetch_next_offset = forward_end;
+                        self.prefetch_range = Some((forward_end, prefetch_end + 1));
                         self.prefetch_task = self.spawn_prefetch_task(source, forward_end, prefetch_end);
                     }
                 }
             }
         }
+    }
+
+    /// Appends incoming data to `forward_buffer`, ensuring that front bytes below
+    /// `min_retain_offset` are drained only as needed, and that `forward_start_offset`
+    /// NEVER exceeds `min_retain_offset`.
+    pub fn append_to_forward_buffer(&mut self, data: &[u8], min_retain_offset: u64) {
+        if data.is_empty() {
+            return;
+        }
+        let incoming_len = data.len();
+        let max_cap = self.forward_capacity;
+
+        if self.forward_buffer.len() + incoming_len > max_cap {
+            let excess = (self.forward_buffer.len() + incoming_len) - max_cap;
+            let max_drainable = min_retain_offset.saturating_sub(self.forward_start_offset) as usize;
+            let drain_amount = excess.min(max_drainable).min(self.forward_buffer.len());
+            if drain_amount > 0 {
+                self.forward_buffer.drain(..drain_amount);
+                self.forward_start_offset += drain_amount as u64;
+            }
+        }
+
+        self.forward_buffer.extend(data.iter().copied());
+    }
+
+    /// Awaits and absorbs an in-flight background prefetch task if it covers `required_offset`.
+    /// Returns true if an in-flight prefetch was absorbed.
+    pub async fn try_absorb_prefetch_if_covers(&mut self, required_offset: u64, min_retain_offset: u64) -> bool {
+        if let Some((start_offset, end_offset)) = self.prefetch_range
+            && required_offset >= start_offset
+            && required_offset < end_offset
+            && let Some(task) = self.prefetch_task.take()
+        {
+            self.prefetch_range = None;
+            if let Ok(Ok(bytes)) = task.await {
+                let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+                if start_offset == forward_end {
+                    self.append_to_forward_buffer(&bytes, min_retain_offset);
+                } else if start_offset > forward_end {
+                    self.forward_buffer.make_contiguous().fill(0);
+                    self.forward_buffer.clear();
+                    self.forward_start_offset = start_offset;
+                    self.forward_buffer = VecDeque::from(bytes.to_vec());
+                } else {
+                    let overlap = (forward_end - start_offset) as usize;
+                    if overlap < bytes.len() {
+                        self.append_to_forward_buffer(&bytes[overlap..], min_retain_offset);
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Copies out a slice of up to `len` bytes starting at `offset` from `forward_buffer`.
+    fn copy_out_slice(&self, offset: u64, len: usize) -> Bytes {
+        let rel_offset = (offset - self.forward_start_offset) as usize;
+        let copy_len = len.min(self.forward_buffer.len().saturating_sub(rel_offset));
+        let (s1, s2) = self.forward_buffer.as_slices();
+        if rel_offset + copy_len <= s1.len() {
+            Bytes::copy_from_slice(&s1[rel_offset..rel_offset + copy_len])
+        } else if rel_offset >= s1.len() {
+            let s2_off = rel_offset - s1.len();
+            Bytes::copy_from_slice(&s2[s2_off..s2_off + copy_len])
+        } else {
+            let mut out = Vec::with_capacity(copy_len);
+            out.extend_from_slice(&s1[rel_offset..]);
+            let remaining = copy_len - (s1.len() - rel_offset);
+            out.extend_from_slice(&s2[..remaining]);
+            Bytes::from(out)
+        }
+    }
+
+    /// Calculates safe minimum retain offset so demuxer look-behind margin is preserved.
+    fn calculate_min_retain_offset(&self, offset: u64) -> u64 {
+        let look_behind = if self.enable_progressive {
+            Self::LOOK_BEHIND_MARGIN.min((self.forward_capacity / 4) as u64)
+        } else {
+            0
+        };
+        offset.saturating_sub(look_behind)
     }
 
     /// Toggles proactive background prefetching for smooth video/audio playback.
@@ -418,7 +759,7 @@ impl EphemeralReadHandle {
             if prefetch_len > 0 {
                 let prefetch_end = (forward_end + prefetch_len).saturating_sub(1);
                 let source = Arc::clone(&self.source);
-                self.prefetch_next_offset = forward_end;
+                self.prefetch_range = Some((forward_end, prefetch_end + 1));
                 self.prefetch_task = self.spawn_prefetch_task(source, forward_end, prefetch_end);
             }
         }
@@ -490,33 +831,38 @@ impl EphemeralReadHandle {
 
     /// Serves sequential and small forward reads using the sliding window with fast slice copying.
     async fn read_from_forward_window(&mut self, offset: u64, len: usize) -> Result<Bytes, VfsError> {
+        let min_retain = self.calculate_min_retain_offset(offset);
+
         // 1. Ingest finished background prefetch task without blocking
         if let Some(task) = &self.prefetch_task
             && task.is_finished()
             && let Some(task) = self.prefetch_task.take()
-            && let Ok(Ok(bytes)) = task.await
         {
-            let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
-            if self.prefetch_next_offset == current_end {
-                self.forward_buffer.extend(bytes);
+            let range = self.prefetch_range.take();
+            if let Ok(Ok(bytes)) = task.await
+                && let Some((start_offset, _end_offset)) = range
+            {
+                let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+                if start_offset == forward_end {
+                    self.append_to_forward_buffer(&bytes, min_retain);
+                } else if start_offset > forward_end && offset >= start_offset {
+                    self.forward_buffer.make_contiguous().fill(0);
+                    self.forward_buffer.clear();
+                    self.forward_start_offset = start_offset;
+                    self.forward_buffer = VecDeque::from(bytes.to_vec());
+                }
             }
         }
 
-        // 2. Check for Forward Cache Hit
+        // 2. Full hit in forward_buffer
         let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
         if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
             if self.enable_progressive {
-                // Keep preceding bytes up to forward_capacity to cushion interleaved audio/video demuxer seeks.
-                // Only evict when buffer exceeds forward_capacity, preserving at least LOOK_BEHIND_MARGIN if possible.
-                if self.forward_buffer.len() > self.forward_capacity && self.forward_start_offset < offset {
+                // Drain excess preceding bytes if buffer exceeds capacity, bounded by min_retain
+                if self.forward_buffer.len() > self.forward_capacity && self.forward_start_offset < min_retain {
                     let excess = self.forward_buffer.len() - self.forward_capacity;
-                    let safe_drain_point = offset.saturating_sub(Self::LOOK_BEHIND_MARGIN);
-                    let max_safe_drain = if safe_drain_point > self.forward_start_offset {
-                        (safe_drain_point - self.forward_start_offset) as usize
-                    } else {
-                        (offset - self.forward_start_offset) as usize
-                    };
-                    let extra_drain = excess.min(max_safe_drain);
+                    let max_drainable = (min_retain - self.forward_start_offset) as usize;
+                    let extra_drain = excess.min(max_drainable);
                     if extra_drain > 0 {
                         self.forward_buffer.drain(..extra_drain);
                         self.forward_start_offset += extra_drain as u64;
@@ -530,95 +876,52 @@ impl EphemeralReadHandle {
                 }
             }
 
-            let rel_offset = (offset - self.forward_start_offset) as usize;
-            let copy_len = len.min(self.forward_buffer.len().saturating_sub(rel_offset));
-            let (s1, s2) = self.forward_buffer.as_slices();
-            let result = if rel_offset + copy_len <= s1.len() {
-                Bytes::copy_from_slice(&s1[rel_offset..rel_offset + copy_len])
-            } else if rel_offset >= s1.len() {
-                let s2_off = rel_offset - s1.len();
-                Bytes::copy_from_slice(&s2[s2_off..s2_off + copy_len])
-            } else {
-                let mut out = Vec::with_capacity(copy_len);
-                out.extend_from_slice(&s1[rel_offset..]);
-                let remaining = copy_len - (s1.len() - rel_offset);
-                out.extend_from_slice(&s2[..remaining]);
-                Bytes::from(out)
-            };
-
+            let result = self.copy_out_slice(offset, len);
             self.last_read_end = offset + len as u64;
-
-            // Proactive continuous pipeline prefetch: keep ahead of decoder so buffer never runs dry
             self.maybe_trigger_prefetch(offset + len as u64);
-
             return Ok(result);
         }
 
-        // 3. Forward Buffer exhausted / read beyond forward_end:
-        // If an in-flight prefetch covers this continuation, await and absorb it!
-        if let Some(task) = self.prefetch_task.take() {
-            let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
-            if self.prefetch_next_offset == current_end {
-                if let Ok(Ok(bytes)) = task.await {
-                    self.forward_buffer.extend(bytes);
-                }
-            } else {
-                task.abort();
+        // 3. Range-inclusive prefetch absorption: check if in-flight prefetch covers offset
+        if self.try_absorb_prefetch_if_covers(offset, min_retain).await {
+            let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+            if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
+                let result = self.copy_out_slice(offset, len);
+                self.last_read_end = offset + len as u64;
+                self.sequential_hit_streak = self.sequential_hit_streak.saturating_add(1);
+                self.maybe_trigger_prefetch(offset + len as u64);
+                return Ok(result);
             }
         }
 
-        // Re-check after absorbing in-flight prefetch
+        // 4. Partial hit or sequential continuation:
+        // If offset is inside [forward_start_offset, forward_end], we already have the start!
+        // We only fetch the missing continuation without tossing away existing bytes!
         let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
-        if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
-            if self.enable_progressive {
-                if self.forward_buffer.len() > self.forward_capacity && self.forward_start_offset < offset {
-                    let excess = self.forward_buffer.len() - self.forward_capacity;
-                    let safe_drain_point = offset.saturating_sub(Self::LOOK_BEHIND_MARGIN);
-                    let max_safe_drain = if safe_drain_point > self.forward_start_offset {
-                        (safe_drain_point - self.forward_start_offset) as usize
-                    } else {
-                        (offset - self.forward_start_offset) as usize
-                    };
-                    let extra_drain = excess.min(max_safe_drain);
-                    if extra_drain > 0 {
-                        self.forward_buffer.drain(..extra_drain);
-                        self.forward_start_offset += extra_drain as u64;
-                    }
-                }
-            } else {
-                let rel_offset = (offset - self.forward_start_offset) as usize;
-                if rel_offset > 0 {
-                    self.forward_buffer.drain(..rel_offset);
-                    self.forward_start_offset = offset;
+        if !self.forward_buffer.is_empty()
+            && offset >= self.forward_start_offset
+            && offset <= forward_end
+            && forward_end < self.file_size
+        {
+            let (fetch_size, _) = self.progressive_fetch_and_prefetch_sizes();
+            let needed_len = ((offset + len as u64) - forward_end).max(fetch_size as u64).min(self.file_size - forward_end);
+            if needed_len > 0 {
+                let fetch_end = (forward_end + needed_len).saturating_sub(1);
+                let fetched = self.source.fetch_range(forward_end, fetch_end).await?;
+                self.append_to_forward_buffer(&fetched, min_retain);
+
+                let new_forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+                if offset >= self.forward_start_offset && offset + len as u64 <= new_forward_end {
+                    let result = self.copy_out_slice(offset, len);
+                    self.last_read_end = offset + len as u64;
+                    self.sequential_hit_streak = self.sequential_hit_streak.saturating_add(1);
+                    self.maybe_trigger_prefetch(offset + len as u64);
+                    return Ok(result);
                 }
             }
-
-            let rel_offset = (offset - self.forward_start_offset) as usize;
-            let copy_len = len.min(self.forward_buffer.len().saturating_sub(rel_offset));
-            let (s1, s2) = self.forward_buffer.as_slices();
-            let result = if rel_offset + copy_len <= s1.len() {
-                Bytes::copy_from_slice(&s1[rel_offset..rel_offset + copy_len])
-            } else if rel_offset >= s1.len() {
-                let s2_off = rel_offset - s1.len();
-                Bytes::copy_from_slice(&s2[s2_off..s2_off + copy_len])
-            } else {
-                let mut out = Vec::with_capacity(copy_len);
-                out.extend_from_slice(&s1[rel_offset..]);
-                let remaining = copy_len - (s1.len() - rel_offset);
-                out.extend_from_slice(&s2[..remaining]);
-                Bytes::from(out)
-            };
-
-            self.last_read_end = offset + len as u64;
-            self.sequential_hit_streak = self.sequential_hit_streak.saturating_add(1);
-
-            // Proactive continuous pipeline prefetch
-            self.maybe_trigger_prefetch(offset + len as u64);
-
-            return Ok(result);
         }
 
-        // 4. Genuine Seek or Cold Initial Load:
+        // 5. Genuine Seek or Cold Initial Load
         let is_initial = self.forward_buffer.is_empty() && self.forward_start_offset == 0;
         let is_major_jump = if offset > forward_end {
             offset - forward_end > 4 * 1024 * 1024
@@ -637,6 +940,7 @@ impl EphemeralReadHandle {
         if let Some(task) = self.prefetch_task.take() {
             task.abort();
         }
+        self.prefetch_range = None;
         self.forward_buffer.make_contiguous().fill(0);
         self.forward_buffer.clear();
 
@@ -659,20 +963,7 @@ impl EphemeralReadHandle {
         self.forward_start_offset = offset;
         self.last_read_end = offset + len as u64;
 
-        let rel_offset = (offset - self.forward_start_offset) as usize;
-        let copy_len = len.min(self.forward_buffer.len().saturating_sub(rel_offset));
-        let (s1, s2) = self.forward_buffer.as_slices();
-        let result = if rel_offset + copy_len <= s1.len() {
-            Bytes::copy_from_slice(&s1[rel_offset..rel_offset + copy_len])
-        } else if rel_offset >= s1.len() {
-            let s2_off = rel_offset - s1.len();
-            Bytes::copy_from_slice(&s2[s2_off..s2_off + copy_len])
-        } else {
-            let mut out = Vec::with_capacity(copy_len);
-            out.extend_from_slice(s1);
-            out.extend_from_slice(&s2[..copy_len - s1.len()]);
-            Bytes::from(out)
-        };
+        let result = self.copy_out_slice(offset, len);
 
         // Immediately start background prefetch for the NEXT segment if prefetch_size > 0
         if self.enable_prefetch && prefetch_size > 0 {
@@ -682,7 +973,7 @@ impl EphemeralReadHandle {
                 if prefetch_len > 0 {
                     let prefetch_end = (current_end + prefetch_len).saturating_sub(1);
                     let source = Arc::clone(&self.source);
-                    self.prefetch_next_offset = current_end;
+                    self.prefetch_range = Some((current_end, prefetch_end + 1));
                     self.prefetch_task = self.spawn_prefetch_task(source, current_end, prefetch_end);
                 }
             }
@@ -715,6 +1006,7 @@ impl Drop for EphemeralReadHandle {
         if let Some(task) = self.prefetch_task.take() {
             task.abort();
         }
+        self.prefetch_range = None;
 
         // Zeroize memory buffers before dropping
         self.forward_buffer.make_contiguous().fill(0);
@@ -959,5 +1251,142 @@ mod tests {
         let (fetch_size, prefetch_size) = handle.progressive_fetch_and_prefetch_sizes();
         assert_eq!(fetch_size, 8 * 1024 * 1024);
         assert_eq!(prefetch_size, 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_partial_overlap_never_corrupts_offsets() {
+        let size = 32 * 1024 * 1024; // 32 MB
+        let mut data = Vec::with_capacity(size);
+        for i in 0..size {
+            data.push((i % 251) as u8);
+        }
+        let source = Arc::new(MockByteSource::new(Bytes::from(data.clone())));
+        let valve = Arc::new(MemoryBackpressureValve::new());
+
+        let mut handle = EphemeralReadHandle::with_capacities(
+            30,
+            source,
+            &valve,
+            8 * 1024 * 1024, // 8 MB forward window
+            256 * 1024,      // 256 KB tail window
+        )
+        .expect("Handle creation failed");
+
+        handle.enable_progressive(true);
+
+        // 1. Fill forward_buffer to exact capacity (8 MB)
+        handle.forward_buffer = VecDeque::from(data[0..8 * 1024 * 1024].to_vec());
+        handle.forward_start_offset = 0;
+        assert_eq!(handle.forward_start_offset, 0);
+        assert_eq!(handle.forward_buffer.len(), 8 * 1024 * 1024);
+
+        // 2. Read crossing the exact 8 MB boundary: offset = 8 MB - 16 KB, len = 64 KB
+        let offset = 8 * 1024 * 1024 - 16 * 1024;
+        let len = 64 * 1024;
+        let chunk2 = handle.read(offset, len).await.expect("Boundary read failed");
+        assert_eq!(chunk2.len(), len);
+
+        // Assert that EVERY byte returned matches exactly (offset + i) % 251 with ZERO corruption or shift!
+        for (i, &byte) in chunk2.iter().enumerate() {
+            let expected = ((offset + i as u64) % 251) as u8;
+            assert_eq!(
+                byte, expected,
+                "Byte corruption at index {i} (offset {}): got {byte:#04x}, expected {expected:#04x}",
+                offset + i as u64
+            );
+        }
+
+        // Verify that forward_start_offset NEVER exceeded offset!
+        assert!(
+            handle.forward_start_offset <= offset,
+            "forward_start_offset ({}) must never exceed read offset ({})",
+            handle.forward_start_offset,
+            offset
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_handle_shared_inode_cache_deduplication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingByteSource {
+            inner: MockByteSource,
+            fetch_count: Arc<AtomicUsize>,
+        }
+
+        impl ByteSource for CountingByteSource {
+            fn file_size(&self) -> u64 {
+                self.inner.file_size()
+            }
+            fn fetch_range<'a>(&'a self, start: u64, end: u64) -> BoxFuture<'a, Result<Bytes, VfsError>> {
+                self.fetch_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.fetch_range(start, end)
+            }
+        }
+
+        let size = 16 * 1024 * 1024; // 16 MB
+        let mut data = Vec::with_capacity(size);
+        for i in 0..size {
+            data.push((i % 251) as u8);
+        }
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let counting_source = Arc::new(CountingByteSource {
+            inner: MockByteSource::new(Bytes::from(data.clone())),
+            fetch_count: Arc::clone(&fetch_count),
+        });
+
+        let shared_cache = Arc::new(SharedInodeBlockCache::default());
+        let valve = Arc::new(MemoryBackpressureValve::new());
+
+        let cached_source_1 = Arc::new(CachedByteSource::new(
+            1001,
+            Arc::clone(&counting_source) as Arc<dyn ByteSource>,
+            Arc::clone(&shared_cache),
+            None,
+        ));
+        let cached_source_2 = Arc::new(CachedByteSource::new(
+            1001,
+            Arc::clone(&counting_source) as Arc<dyn ByteSource>,
+            Arc::clone(&shared_cache),
+            None,
+        ));
+
+        let mut handle_1 = EphemeralReadHandle::with_capacities(
+            101,
+            cached_source_1,
+            &valve,
+            8 * 1024 * 1024,
+            256 * 1024,
+        )
+        .expect("Handle 1 failed");
+
+        let mut handle_2 = EphemeralReadHandle::with_capacities(
+            102,
+            cached_source_2,
+            &valve,
+            8 * 1024 * 1024,
+            256 * 1024,
+        )
+        .expect("Handle 2 failed");
+
+        // Handle 1 reads first 8 MB (Blocks 0..3)
+        let chunk_h1 = handle_1.read(0, 8 * 1024 * 1024).await.expect("H1 read failed");
+        assert_eq!(chunk_h1.len(), 8 * 1024 * 1024);
+        assert_eq!(&chunk_h1[..], &data[0..8 * 1024 * 1024]);
+
+        let count_after_h1 = fetch_count.load(Ordering::SeqCst);
+        assert!(count_after_h1 >= 1, "H1 must fetch blocks from inner source");
+
+        // Handle 2 reads from the same video file (overlapping range in Block 0)
+        let chunk_h2 = handle_2.read(0, 2 * 1024 * 1024).await.expect("H2 read failed");
+        assert_eq!(chunk_h2.len(), 2 * 1024 * 1024);
+        assert_eq!(&chunk_h2[..], &data[0..2 * 1024 * 1024]);
+
+        // Assert 0 duplicate network calls occurred!
+        let count_after_h2 = fetch_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count_after_h2, count_after_h1,
+            "Handle 2 must hit SharedInodeBlockCache with 0 duplicate HTTP calls!"
+        );
     }
 }
