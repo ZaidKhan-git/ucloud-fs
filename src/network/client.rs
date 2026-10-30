@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rand::Rng;
-use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, RANGE, RETRY_AFTER};
+use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, CONTENT_TYPE, RANGE, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -269,8 +269,7 @@ impl GoogleDriveClient {
                     }
 
                     let is_retryable = status == StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error()
-                        || status == StatusCode::FORBIDDEN;
+                        || status.is_server_error();
 
                     if is_retryable && attempt < self.backoff_config.max_attempts {
                         let backoff = self.calculate_backoff(Some(&response), attempt);
@@ -296,17 +295,18 @@ impl GoogleDriveClient {
                     // Explicitly drop guard on terminal failure
                     drop(permit_guard);
 
+                    let err_body = response.text().await.unwrap_or_default();
                     return match status {
                         StatusCode::NOT_FOUND => Err(VfsError::NotFound(format!(
-                            "Google Drive resource not found ({status})"
+                            "Google Drive resource not found ({status}): {err_body}"
                         ))),
                         StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
                             Err(VfsError::PermissionDenied(format!(
-                                "Google Drive auth/quota error ({status})"
+                                "Google Drive auth/quota error ({status}): {err_body}"
                             )))
                         }
                         _ => Err(VfsError::InternalFault(format!(
-                            "Google Drive API error: {status}"
+                            "Google Drive API error ({status}): {err_body}"
                         ))),
                     };
                 }
@@ -551,6 +551,90 @@ impl GoogleDriveClient {
             .await?;
 
         Ok(())
+    }
+
+    /// Renames a file or folder on Google Drive via PATCH /drive/v3/files/{file_id}.
+    pub async fn rename_file(
+        &self,
+        account_id: &str,
+        access_token: &str,
+        file_id: &str,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
+        let url = format!("{}/drive/v3/files/{}", self.base_url, file_id);
+        let token_header = format!("Bearer {access_token}");
+        let body = serde_json::json!({ "name": new_name });
+
+        let _ = self
+            .execute_request(account_id, QuotaCost::FilesUpdate, |client| {
+                let u = url.clone();
+                let auth = token_header.clone();
+                let b = body.clone();
+                async move {
+                    client
+                        .patch(&u)
+                        .header(AUTHORIZATION, auth)
+                        .header(CONTENT_TYPE, "application/json")
+                        .json(&b)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Creates a new directory/folder on Google Drive.
+    pub async fn create_folder(
+        &self,
+        account_id: &str,
+        access_token: &str,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String, VfsError> {
+        let url = format!("{}/drive/v3/files", self.base_url);
+        let token_header = format!("Bearer {access_token}");
+
+        let metadata = GoogleFileInput {
+            name: name.to_string(),
+            mime_type: Some("application/vnd.google-apps.folder".to_string()),
+            parents: parent_id.map(|pid| vec![pid.to_string()]),
+            app_properties: None,
+        };
+
+        let body = serde_json::to_vec(&metadata).map_err(|e| {
+            VfsError::InternalFault(format!("Failed to serialize folder metadata: {e}"))
+        })?;
+
+        let resp = self
+            .execute_request(account_id, QuotaCost::FilesCreate, |client| {
+                let u = url.clone();
+                let auth = token_header.clone();
+                let b = body.clone();
+                async move {
+                    client
+                        .post(&u)
+                        .header(AUTHORIZATION, auth)
+                        .header("Content-Type", "application/json; charset=UTF-8")
+                        .body(b)
+                        .send()
+                        .await
+                }
+            })
+            .await?;
+
+        #[derive(serde::Deserialize)]
+        struct FolderResponse {
+            id: String,
+        }
+
+        let folder = resp
+            .json::<FolderResponse>()
+            .await
+            .map_err(|e| VfsError::InternalFault(format!("Failed to parse folder creation response: {e}")))?;
+
+        Ok(folder.id)
     }
 
     /// Initiates a Resumable Upload session for a file or chunk.

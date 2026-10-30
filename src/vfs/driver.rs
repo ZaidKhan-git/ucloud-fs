@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::VfsError;
 use crate::network::client::{GoogleDriveClient, GoogleFileInput};
@@ -194,12 +194,16 @@ impl UcloudFsDriver {
         Fut: std::future::Future<Output = Result<R, VfsError>>,
     {
         self.execute_vfs_op(path_for_validation, || {
-            let fut = async_op();
-            let timeout_fut = tokio::time::timeout(Duration::from_secs(120), fut);
             let res = if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::task::block_in_place(|| self.rt_handle.block_on(timeout_fut))
+                tokio::task::block_in_place(|| {
+                    self.rt_handle.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(120), async_op()).await
+                    })
+                })
             } else {
-                self.rt_handle.block_on(timeout_fut)
+                self.rt_handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(120), async_op()).await
+                })
             };
             res.map_err(|_| VfsError::RateLimitTimeout)?
         })
@@ -290,6 +294,89 @@ impl UcloudFsDriver {
         })
     }
 
+    /// Retrieves file information for an active open handle, including in-flight writes.
+    fn file_info_from_handle_state(&self, fh: u64, state: &HandleState) -> Result<FileInfo, VfsError> {
+        match state {
+            HandleState::Directory { ino } => {
+                let node = self
+                    .routing_table
+                    .get_inode(*ino)
+                    .ok_or_else(|| VfsError::NotFound(format!("Inode {ino} not found")))?;
+                Ok(FileInfo {
+                    ino: *ino,
+                    size: 0,
+                    allocation_size: 0,
+                    is_directory: true,
+                    is_readonly: false,
+                    created_time: node.created_time,
+                    modified_time: node.modified_time,
+                    file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+                })
+            }
+            HandleState::Read { ino, .. } => {
+                let node = self
+                    .routing_table
+                    .get_inode(*ino)
+                    .ok_or_else(|| VfsError::NotFound(format!("Inode {ino} not found")))?;
+                let attributes = if node.is_workspace_doc {
+                    FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                };
+                Ok(FileInfo {
+                    ino: *ino,
+                    size: node.size,
+                    allocation_size: node.size,
+                    is_directory: false,
+                    is_readonly: node.is_workspace_doc,
+                    created_time: node.created_time,
+                    modified_time: node.modified_time,
+                    file_attributes: attributes,
+                })
+            }
+            HandleState::WritePending(wp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let size = if let Some(spool) = &wp.write_spool {
+                    spool.flushed_bytes() + spool.current_ram_usage() as u64
+                } else {
+                    wp.uploaded_bytes.len() as u64
+                };
+                let alloc = size.max(wp.allocation_size);
+                Ok(FileInfo {
+                    ino: fh,
+                    size,
+                    allocation_size: alloc,
+                    is_directory: false,
+                    is_readonly: false,
+                    created_time: now,
+                    modified_time: now,
+                    file_attributes: FILE_ATTRIBUTE_NORMAL,
+                })
+            }
+        }
+    }
+
+    /// Retrieves file information for an active open handle, with instantaneous non-blocking fast path.
+    pub fn get_file_info_by_handle(&self, fh: u64) -> Result<FileInfo, VfsError> {
+        let handle_arc = self
+            .open_handles
+            .get(&fh)
+            .map(|g| Arc::clone(g.value()))
+            .ok_or_else(|| VfsError::NotFound(format!("File handle {fh} not found")))?;
+
+        if let Ok(state) = handle_arc.try_lock() {
+            return self.file_info_from_handle_state(fh, &state);
+        }
+
+        self.execute_vfs_async_op(None, || async {
+            let state = handle_arc.lock().await;
+            self.file_info_from_handle_state(fh, &state)
+        })
+    }
+
     /// Opens an existing file for reading.
     pub fn open(&self, path: &str) -> Result<u64, VfsError> {
         self.execute_vfs_op(Some(path), || {
@@ -372,7 +459,13 @@ impl UcloudFsDriver {
                 }
             };
 
-            let read_handle = EphemeralReadHandle::new(self.allocate_fh(), byte_source, &self.valve)?;
+            let read_handle = EphemeralReadHandle::with_capacities(
+                self.allocate_fh(),
+                byte_source,
+                &self.valve,
+                16 * 1024 * 1024, // 16 MB forward window for smooth 1080p video streaming
+                512 * 1024,       // 512 KB tail window
+            )?;
             let fh = read_handle.fh();
 
             let _ = self.sync_engine.register_open_handle(ino);
@@ -419,6 +512,75 @@ impl UcloudFsDriver {
         })
     }
 
+    /// Creates a new directory and spawns cloud folder creation on all linked Google accounts.
+    pub fn create_directory(&self, path: &str) -> Result<u64, VfsError> {
+        self.execute_vfs_op(Some(path), || {
+            let (parent_ino, dirname) = self.resolve_path_parent_and_name(path)?;
+            let ino = self.routing_table.create_virtual_directory(parent_ino, &dirname)?;
+            let fh = self.allocate_fh();
+            self.open_handles.insert(
+                fh,
+                Arc::new(Mutex::new(HandleState::Directory { ino })),
+            );
+            self.notifier.notify_created(path);
+            let parent_path = self.routing_table.get_path_for_inode(parent_ino).unwrap_or_else(|| "/".to_string());
+            self.notifier.notify_updated(&parent_path);
+
+            // Asynchronously dispatch remote folder creation to Google Drive
+            let client = Arc::clone(&self.client);
+            let routing_table = Arc::clone(&self.routing_table);
+            let sync_engine = Arc::clone(&self.sync_engine);
+            let dirname_clone = dirname.clone();
+            let tokens: Vec<(String, String)> = self
+                .account_tokens
+                .iter()
+                .map(|kv| (kv.key().clone(), kv.value().clone()))
+                .collect();
+
+            self.rt_handle.spawn(async move {
+                for (account_id, token) in tokens {
+                    let parent_remote = if parent_ino == InMemoryRoutingTable::ROOT_INO {
+                        None
+                    } else {
+                        routing_table.get_remote_folder_id(parent_ino, &account_id)
+                    };
+
+                    match client
+                        .create_folder(
+                            &account_id,
+                            &token,
+                            &dirname_clone,
+                            parent_remote.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(remote_id) => {
+                            routing_table.record_remote_folder_id(ino, &account_id, &remote_id);
+                            sync_engine.record_local_upsert(&account_id, &remote_id);
+                            info!(
+                                account = %account_id,
+                                dirname = %dirname_clone,
+                                remote_id = %remote_id,
+                                "Created remote folder on Google Drive"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                account = %account_id,
+                                dirname = %dirname_clone,
+                                error = %e,
+                                "Failed to create remote folder on Google Drive"
+                            );
+                        }
+                    }
+                }
+            });
+
+            debug!(fh, path, ino, "Created virtual directory handle and spawned cloud folder creation");
+            Ok(fh)
+        })
+    }
+
     /// Sets the file size / allocation size. Intercepts allocation size to resolve placement target!
     pub fn set_file_size(&self, fh: u64, size: u64) -> Result<(), VfsError> {
         self.execute_vfs_async_op(None, || async move {
@@ -442,10 +604,15 @@ impl UcloudFsDriver {
                         PlacementDecision::SingleAccount(guard) => {
                             let account_id = guard.account_id.clone();
                             let token = self.account_tokens.get(&account_id).map(|t| t.clone()).unwrap_or_default();
+                            let parent_remote = if wp.parent_ino == InMemoryRoutingTable::ROOT_INO {
+                                None
+                            } else {
+                                self.routing_table.get_remote_folder_id(wp.parent_ino, &account_id)
+                            };
                             let metadata = GoogleFileInput {
                                 name: wp.filename.clone(),
                                 mime_type: Some("application/octet-stream".to_string()),
-                                parents: None,
+                                parents: parent_remote.map(|pid| vec![pid]),
                                 app_properties: None,
                             };
 
@@ -553,7 +720,7 @@ impl UcloudFsDriver {
         })
     }
 
-    /// Renames a virtual file or directory.
+    /// Renames a virtual file or directory, propagating the rename to Google Drive.
     pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), VfsError> {
         self.execute_vfs_op(Some(old_path), || {
             sandbox::validate_path(new_path)?;
@@ -561,14 +728,71 @@ impl UcloudFsDriver {
             let (old_parent, old_name) = self.resolve_path_parent_and_name(old_path)?;
             let (new_parent, new_name) = self.resolve_path_parent_and_name(new_path)?;
 
+            let target_ino = self
+                .routing_table
+                .lookup(old_parent, &old_name)
+                .ok_or_else(|| VfsError::NotFound(format!("File or directory '{old_name}' not found for rename")))?;
+
+            let node = self
+                .routing_table
+                .get_inode(target_ino)
+                .ok_or_else(|| VfsError::NotFound(format!("Inode {target_ino} not found for rename")))?;
+
+            // Collect cloud rename targets
+            let mut cloud_renames = Vec::new();
+            match &node.location {
+                StorageLocation::SingleAccount { account_id, google_file_id } => {
+                    self.sync_engine.record_local_upsert(account_id, google_file_id);
+                    cloud_renames.push((account_id.clone(), google_file_id.clone()));
+                }
+                StorageLocation::StripedManifest { manifest_account_id, manifest_google_file_id, .. } => {
+                    self.sync_engine.record_local_upsert(manifest_account_id, manifest_google_file_id);
+                    cloud_renames.push((manifest_account_id.clone(), manifest_google_file_id.clone()));
+                }
+                StorageLocation::VirtualDirectory => {
+                    for acc_id in self.account_tokens.iter().map(|kv| kv.key().clone()) {
+                        if let Some(folder_id) = self.routing_table.get_remote_folder_id(target_ino, &acc_id) {
+                            self.sync_engine.record_local_upsert(&acc_id, &folder_id);
+                            cloud_renames.push((acc_id, folder_id));
+                        }
+                    }
+                }
+                StorageLocation::VirtualWarningNote { .. } => {}
+            }
+
             self.routing_table.rename(old_parent, &old_name, new_parent, &new_name)?;
-            self.notifier.notify_updated(new_path);
-            info!(old_path, new_path, "Renamed filesystem entry");
+            self.notifier.notify_deleted(old_path);
+            self.notifier.notify_created(new_path);
+            let old_parent_path = self.routing_table.get_path_for_inode(old_parent).unwrap_or_else(|| "/".to_string());
+            self.notifier.notify_updated(&old_parent_path);
+            if new_parent != old_parent {
+                let new_parent_path = self.routing_table.get_path_for_inode(new_parent).unwrap_or_else(|| "/".to_string());
+                self.notifier.notify_updated(&new_parent_path);
+            }
+
+            if !cloud_renames.is_empty() {
+                let client = Arc::clone(&self.client);
+                let tokens_map: HashMap<String, String> = self.account_tokens.iter().map(|kv| (kv.key().clone(), kv.value().clone())).collect();
+                let new_name_clone = new_name.clone();
+                self.rt_handle.spawn(async move {
+                    for (account_id, file_id) in cloud_renames {
+                        if let Some(token) = tokens_map.get(&account_id) {
+                            if let Err(e) = client.rename_file(&account_id, token, &file_id, &new_name_clone).await {
+                                warn!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, error = %e, "Failed to rename on Google Drive");
+                            } else {
+                                info!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, "Successfully renamed on Google Drive");
+                            }
+                        }
+                    }
+                });
+            }
+
+            info!(old_path, new_path, "Renamed filesystem entry and dispatched cloud renames");
             Ok(())
         })
     }
 
-    /// Deletes a file or directory.
+    /// Deletes a file or directory, propagating the deletion to Google Drive.
     pub fn delete(&self, path: &str) -> Result<(), VfsError> {
         self.execute_vfs_op(Some(path), || {
             let (parent_ino, filename) = self.resolve_path_parent_and_name(path)?;
@@ -576,18 +800,63 @@ impl UcloudFsDriver {
                 VfsError::NotFound(format!("File or directory '{path}' not found for deletion"))
             })?;
 
-            if let Some(node) = self.routing_table.get_inode(ino)
-                && node.is_directory
-                && !node.children.is_empty()
-            {
+            let node = self.routing_table.get_inode(ino).ok_or_else(|| {
+                VfsError::NotFound(format!("Inode {ino} not found for deletion"))
+            })?;
+
+            if node.is_directory && !node.children.is_empty() {
                 return Err(VfsError::InternalFault(
                     "Directory not empty".to_string(),
                 ));
             }
 
+            // Collect remote cloud deletion targets
+            let mut cloud_deletions = Vec::new();
+            match &node.location {
+                StorageLocation::SingleAccount { account_id, google_file_id } => {
+                    self.sync_engine.record_local_mutation(account_id, google_file_id);
+                    cloud_deletions.push((account_id.clone(), google_file_id.clone()));
+                    self.placement_engine.release_used_bytes(account_id, node.size);
+                }
+                StorageLocation::StripedManifest {
+                    manifest_account_id,
+                    manifest_google_file_id,
+                    ..
+                } => {
+                    self.sync_engine.record_local_mutation(manifest_account_id, manifest_google_file_id);
+                    cloud_deletions.push((manifest_account_id.clone(), manifest_google_file_id.clone()));
+                }
+                StorageLocation::VirtualDirectory => {
+                    for (acc_id, folder_id) in self.routing_table.get_all_remote_folder_ids(ino) {
+                        self.sync_engine.record_local_mutation(&acc_id, &folder_id);
+                        cloud_deletions.push((acc_id, folder_id));
+                    }
+                }
+                StorageLocation::VirtualWarningNote { .. } => {}
+            }
+
             let _ = self.routing_table.remove(parent_ino, &filename)?;
             self.notifier.notify_deleted(path);
-            info!(path, "Deleted filesystem entry");
+            let parent_path = self.routing_table.get_path_for_inode(parent_ino).unwrap_or_else(|| "/".to_string());
+            self.notifier.notify_updated(&parent_path);
+
+            if !cloud_deletions.is_empty() {
+                let client = Arc::clone(&self.client);
+                let tokens_map: HashMap<String, String> = self.account_tokens.iter().map(|kv| (kv.key().clone(), kv.value().clone())).collect();
+                self.rt_handle.spawn(async move {
+                    for (account_id, file_id) in cloud_deletions {
+                        if let Some(token) = tokens_map.get(&account_id) {
+                            if let Err(e) = client.delete_file(&account_id, token, &file_id).await {
+                                warn!(account = %account_id, file_id = %file_id, error = %e, "Failed to delete file on Google Drive");
+                            } else {
+                                info!(account = %account_id, file_id = %file_id, "Successfully deleted remote file on Google Drive");
+                            }
+                        }
+                    }
+                });
+            }
+
+            info!(path, "Deleted filesystem entry and dispatched cloud deletions");
             Ok(())
         })
     }
@@ -607,6 +876,60 @@ impl UcloudFsDriver {
                     return Ok(());
                 }
 
+                // If no spool was initialized yet (e.g. WriteFile was called without SetFileSize),
+                // initialize spool now from accumulated uploaded_bytes.
+                if wp.write_spool.is_none() && wp.striped_guard.is_none() {
+                    let total_bytes = wp.uploaded_bytes.len() as u64;
+                    let decision = self
+                        .placement_engine
+                        .resolve_placement(total_bytes.max(1), &wp.filename, &*self.prompter)
+                        .await?;
+
+                    match decision {
+                        PlacementDecision::SingleAccount(guard) => {
+                            let account_id = guard.account_id.clone();
+                            let token = self
+                                .account_tokens
+                                .get(&account_id)
+                                .map(|t| t.clone())
+                                .unwrap_or_default();
+                            let parent_remote = if wp.parent_ino == InMemoryRoutingTable::ROOT_INO {
+                                None
+                            } else {
+                                self.routing_table.get_remote_folder_id(wp.parent_ino, &account_id)
+                            };
+                            let metadata = GoogleFileInput {
+                                name: wp.filename.clone(),
+                                mime_type: Some("application/octet-stream".to_string()),
+                                parents: parent_remote.map(|pid| vec![pid]),
+                                app_properties: None,
+                            };
+                            let session_uri = self
+                                .client
+                                .initiate_resumable_upload(&account_id, &token, &metadata)
+                                .await
+                                .unwrap_or_else(|_| format!("http://127.0.0.1:0/mock_session_{fh}"));
+                            let mut spool = EphemeralWriteHandle::new(
+                                fh,
+                                Arc::clone(&self.client),
+                                account_id,
+                                session_uri,
+                                &self.valve,
+                            )?;
+                            spool.set_declared_size(total_bytes);
+                            if !wp.uploaded_bytes.is_empty() {
+                                spool.write(0, &wp.uploaded_bytes).await?;
+                            }
+                            wp.write_spool = Some(spool);
+                            wp.single_guard = Some(guard);
+                        }
+                        PlacementDecision::StripedManifest(guard) => {
+                            wp.striped_plan = Some(guard.plan.clone());
+                            wp.striped_guard = Some(guard);
+                        }
+                    }
+                }
+
                 if let Some(mut spool) = wp.write_spool.take() {
                     let account_id = spool.account_id().to_string();
                     let commit_res = spool.commit().await?;
@@ -616,8 +939,8 @@ impl UcloudFsDriver {
                     }
 
                     let location = StorageLocation::SingleAccount {
-                        account_id,
-                        google_file_id: commit_res.file_id,
+                        account_id: account_id.clone(),
+                        google_file_id: commit_res.file_id.clone(),
                     };
 
                     let _ = self.routing_table.insert_file(NewFileParams {
@@ -631,6 +954,7 @@ impl UcloudFsDriver {
                         web_view_link: None,
                     })?;
 
+                    self.sync_engine.record_local_upsert(&account_id, &commit_res.file_id);
                     self.notifier.notify_created(&wp.path);
                     info!(path = %wp.path, total_bytes = commit_res.total_bytes, "Committed single file upload to VFS");
                 } else if let Some(guard) = wp.striped_guard.take() {
@@ -644,7 +968,7 @@ impl UcloudFsDriver {
                         Arc::clone(&self.routing_table),
                     );
 
-                    let manifest_file_id = chunker
+                    let unified_ino = chunker
                         .upload_striped_file(
                             wp.parent_ino,
                             guard,
@@ -653,8 +977,19 @@ impl UcloudFsDriver {
                         )
                         .await?;
 
+                    if let Some(node) = self.routing_table.get_inode(unified_ino)
+                        && let StorageLocation::StripedManifest {
+                            manifest_account_id,
+                            manifest_google_file_id,
+                            ..
+                        } = &node.location
+                    {
+                        self.sync_engine
+                            .record_local_upsert(manifest_account_id, manifest_google_file_id);
+                    }
+
                     self.notifier.notify_created(&wp.path);
-                    info!(path = %wp.path, manifest_file_id, "Committed multi-account striped upload to VFS");
+                    info!(path = %wp.path, unified_ino, "Committed multi-account striped upload to VFS");
                 }
             }
 

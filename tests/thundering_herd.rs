@@ -26,6 +26,8 @@ async fn test_thundering_herd_token_refresh_stress() {
         refresh_token: "refresh_token_valid".to_string(),
         access_token: "expired_old_access_token".to_string(),
         expires_at_unix: 0, // Expired at epoch (forces immediate refresh)
+        client_id: None,
+        client_secret: None,
     };
     let manager = Arc::new(AccountTokenManager::new(
         "stress_user@gmail.com".to_string(),

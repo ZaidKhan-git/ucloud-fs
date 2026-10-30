@@ -13,10 +13,19 @@ pub const DEFAULT_GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/t
 pub const DEFAULT_GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 /// PKCE code verifier and S256 challenge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PkcePair {
     pub verifier: String,
     pub challenge: String,
+}
+
+impl std::fmt::Debug for PkcePair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PkcePair")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
 }
 
 /// Generates a cryptographic PKCE code verifier and S256 challenge.
@@ -46,13 +55,52 @@ pub fn generate_csrf_state() -> String {
 }
 
 /// Google OAuth token response payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokenResponse {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
     pub expires_in: u64,
     pub token_type: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+/// Percent-decodes a URL query parameter string.
+#[must_use]
+pub fn url_decode(s: &str) -> String {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex_sub = std::str::from_utf8(&bytes[i + 1..=i + 2]).unwrap_or_default();
+            if let Ok(hex_val) = u8::from_str_radix(hex_sub, 16) {
+                result.push(hex_val);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 /// Starts an ephemeral loopback HTTP listener on `127.0.0.1:0` to capture OAuth redirect code.
@@ -62,60 +110,83 @@ pub async fn capture_loopback_code(
     timeout_duration: Duration,
 ) -> Result<String, VfsError> {
     let accept_task = async {
-        let (mut socket, _) = listener.accept().await.map_err(|e| {
-            VfsError::InternalFault(format!("Failed to accept loopback connection: {}", e))
-        })?;
+        loop {
+            let (mut socket, _) = listener.accept().await.map_err(|e| {
+                VfsError::InternalFault(format!("Failed to accept loopback connection: {}", e))
+            })?;
 
-        let mut buffer = [0u8; 2048];
-        let bytes_read = socket.read(&mut buffer).await.map_err(|e| {
-            VfsError::InternalFault(format!("Failed to read HTTP request: {}", e))
-        })?;
+            let mut buffer = [0u8; 4096];
+            let bytes_read = match socket.read(&mut buffer).await {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
 
-        let request_str = std::str::from_utf8(&buffer[..bytes_read]).map_err(|e| {
-            VfsError::InternalFault(format!("Malformed UTF-8 in HTTP request: {}", e))
-        })?;
+            let request_str = match std::str::from_utf8(&buffer[..bytes_read]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-        // Extract query string from GET request line: "GET /?code=...&state=... HTTP/1.1"
-        let first_line = request_str.lines().next().unwrap_or("");
-        let query_path = first_line.split_whitespace().nth(1).unwrap_or("");
+            // Extract query string from GET request line: "GET /?code=...&state=... HTTP/1.1"
+            let first_line = request_str.lines().next().unwrap_or("");
+            let query_path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-        let query = query_path.split('?').nth(1).unwrap_or("");
-        let mut code: Option<String> = None;
-        let mut state: Option<String> = None;
+            if query_path.starts_with("/favicon.ico") {
+                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+                continue;
+            }
 
-        for param in query.split('&') {
-            let mut parts = param.split('=');
-            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                if k == "code" {
-                    code = Some(v.to_string());
-                } else if k == "state" {
-                    state = Some(v.to_string());
+            let query = query_path.split('?').nth(1).unwrap_or("");
+            let mut code: Option<String> = None;
+            let mut state: Option<String> = None;
+            let mut oauth_err: Option<String> = None;
+
+            for param in query.split('&') {
+                if let Some((k, v)) = param.split_once('=') {
+                    if k == "code" {
+                        code = Some(url_decode(v));
+                    } else if k == "state" {
+                        state = Some(url_decode(v));
+                    } else if k == "error" {
+                        oauth_err = Some(url_decode(v));
+                    }
                 }
             }
+
+            if let Some(err_msg) = oauth_err {
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<h3>Authentication Error: {err_msg}</h3>"
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                return Err(VfsError::PermissionDenied(format!("Google OAuth error: {err_msg}")));
+            }
+
+            if state.as_deref() != Some(expected_state) {
+                let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<h3>CSRF State Mismatch</h3>";
+                let _ = socket.write_all(resp.as_bytes()).await;
+                return Err(VfsError::PermissionDenied(
+                    "CSRF state validation failed".to_string(),
+                ));
+            }
+
+            let auth_code = code.ok_or_else(|| {
+                VfsError::PermissionDenied("Missing authorization code in OAuth redirect".to_string())
+            })?;
+
+            let success_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                <html><head><title>ucloud-fs Authentication Successful</title></head>\
+                <body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;text-align:center;padding:60px;background:#f8fafc;color:#1e293b;'>\
+                <div style='max-width:480px;margin:0 auto;background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);'>\
+                <h2 style='color:#059669;margin-top:0;'>Authentication Successful!</h2>\
+                <p style='color:#64748b;line-height:1.6;'>Your Google Drive account has been securely linked to <strong>ucloud-fs</strong>.</p>\
+                <p style='font-size:14px;color:#94a3b8;'>You may now close this browser tab and return to the terminal.</p>\
+                </div></body></html>";
+
+            let _ = socket.write_all(success_resp.as_bytes()).await;
+            let _ = socket.flush().await;
+
+            return Ok(auth_code);
         }
-
-        if state.as_deref() != Some(expected_state) {
-            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<h3>CSRF State Mismatch</h3>";
-            let _ = socket.write_all(resp.as_bytes()).await;
-            return Err(VfsError::PermissionDenied(
-                "CSRF state validation failed".to_string(),
-            ));
-        }
-
-        let auth_code = code.ok_or_else(|| {
-            VfsError::PermissionDenied("Missing authorization code in OAuth redirect".to_string())
-        })?;
-
-        let success_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
-            <html><body style='font-family:sans-serif;text-align:center;padding:50px;'>\
-            <h2>Authentication Successful!</h2>\
-            <p>You may now close this window and return to the application.</p>\
-            </body></html>";
-
-        let _ = socket.write_all(success_resp.as_bytes()).await;
-        let _ = socket.flush().await;
-
-        Ok(auth_code)
     };
 
     match tokio::time::timeout(timeout_duration, accept_task).await {
@@ -150,10 +221,11 @@ pub async fn exchange_code_for_tokens(
         .await
         .map_err(|_| VfsError::NetworkOffline)?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response.text().await.unwrap_or_else(|_| String::new());
         return Err(VfsError::PermissionDenied(format!(
-            "OAuth token exchange failed with status {}",
-            response.status()
+            "OAuth token exchange failed with status {status}: {err_body}"
         )));
     }
 
@@ -185,10 +257,11 @@ pub async fn refresh_access_token(
         .await
         .map_err(|_| VfsError::NetworkOffline)?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response.text().await.unwrap_or_else(|_| String::new());
         return Err(VfsError::PermissionDenied(format!(
-            "OAuth token refresh failed with status {}",
-            response.status()
+            "OAuth token refresh failed with status {status}: {err_body}"
         )));
     }
 

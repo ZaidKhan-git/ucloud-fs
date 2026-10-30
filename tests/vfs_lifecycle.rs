@@ -398,6 +398,7 @@ async fn test_vfs_full_lifecycle_stress() {
         driver.cleanup(fh).expect("cleanup commit");
 
         // 6. close -> release handle
+        driver.close(fh).expect("close write handle");
         driver.close(fh).expect("close handle");
 
         // Verify file exists in VFS and matches size

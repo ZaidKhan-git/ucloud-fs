@@ -23,6 +23,12 @@ pub struct SyncStats {
     pub updated: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalMutationKind {
+    Upsert,
+    Delete,
+}
+
 /// Real-time delta synchronization engine polling `changes.list` and keeping RAM VFS in sync.
 pub struct DeltaSyncEngine {
     client: Arc<GoogleDriveClient>,
@@ -31,7 +37,7 @@ pub struct DeltaSyncEngine {
     session: Arc<SessionController>,
     notifier: Arc<dyn ShellNotifier>,
     page_tokens: DashMap<String, String>,
-    recent_local_mutations: DashMap<(String, String), Instant>,
+    recent_local_mutations: DashMap<(String, String), (LocalMutationKind, Instant)>,
     open_handles: DashMap<u64, Arc<AtomicBool>>,
     poll_interval: Duration,
 }
@@ -89,11 +95,26 @@ impl DeltaSyncEngine {
         self.page_tokens.insert(account_id.to_string(), token);
     }
 
-    /// Records a local upload, deletion, or rename to prevent "self-echo" flicker in changes.list.
+    /// Records a local deletion to prevent "self-echo" flicker in changes.list.
     pub fn record_local_mutation(&self, account_id: &str, file_id: &str) {
+        self.record_local_mutation_kind(account_id, file_id, LocalMutationKind::Delete);
+    }
+
+    /// Records a local upload or rename to prevent "self-echo" flicker in changes.list.
+    pub fn record_local_upsert(&self, account_id: &str, file_id: &str) {
+        self.record_local_mutation_kind(account_id, file_id, LocalMutationKind::Upsert);
+    }
+
+    /// Records a local mutation with explicit kind.
+    pub fn record_local_mutation_kind(
+        &self,
+        account_id: &str,
+        file_id: &str,
+        kind: LocalMutationKind,
+    ) {
         self.recent_local_mutations.insert(
             (account_id.to_string(), file_id.to_string()),
-            Instant::now(),
+            (kind, Instant::now()),
         );
     }
 
@@ -112,12 +133,13 @@ impl DeltaSyncEngine {
     }
 
     /// Checks if a file was recently mutated locally within the 30-second self-echo window.
-    fn is_self_echo(&self, account_id: &str, file_id: &str) -> bool {
+    fn is_self_echo(&self, account_id: &str, file_id: &str, expected_kind: LocalMutationKind) -> bool {
         let key = (account_id.to_string(), file_id.to_string());
-        if let Some(entry) = self.recent_local_mutations.get(&key)
-            && entry.value().elapsed() < Self::SELF_ECHO_TTL
-        {
-            return true;
+        if let Some(entry) = self.recent_local_mutations.get(&key) {
+            let (kind, instant) = *entry.value();
+            if kind == expected_kind && instant.elapsed() < Self::SELF_ECHO_TTL {
+                return true;
+            }
         }
         false
     }
@@ -143,7 +165,7 @@ impl DeltaSyncEngine {
             if is_removed {
                 // 1. Remote Deletion
                 if let Some(ino) = self.routing_table.lookup_by_cloud_id(account_id, file_id) {
-                    if self.is_self_echo(account_id, file_id) {
+                    if self.is_self_echo(account_id, file_id, LocalMutationKind::Delete) {
                         debug!(
                             account = %account_id,
                             file_id,
@@ -185,7 +207,7 @@ impl DeltaSyncEngine {
                 }
             } else if let Some(file) = &change.file {
                 // 2. Remote Addition or Update
-                if self.is_self_echo(account_id, file_id) {
+                if self.is_self_echo(account_id, file_id, LocalMutationKind::Upsert) {
                     debug!(
                         account = %account_id,
                         file_id,
@@ -211,7 +233,7 @@ impl DeltaSyncEngine {
                         debug!(ino = existing_ino, name = %file.name, "Reconciled remote cloud update");
                     }
                 } else {
-                    // New remote file created directly on web drive
+                    // New remote file or folder created directly on web drive
                     let parent_google_id = file
                         .parents
                         .as_ref()
@@ -226,30 +248,49 @@ impl DeltaSyncEngine {
                             .unwrap_or(InMemoryRoutingTable::ROOT_INO),
                     };
 
-                    let size = file.size.as_ref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    let location = StorageLocation::SingleAccount {
-                        account_id: account_id.to_string(),
-                        google_file_id: file.id.clone(),
-                    };
+                    let is_folder = file.mime_type == "application/vnd.google-apps.folder";
 
-                    let _ = self.routing_table.insert_file(NewFileParams {
-                        parent_ino,
-                        name: &file.name,
-                        size,
-                        mime_type: &file.mime_type,
-                        modified_time: 0,
-                        created_time: 0,
-                        location,
-                        web_view_link: None,
-                    })?;
+                    if is_folder {
+                        let _ = self.routing_table.insert_or_merge_directory(
+                            parent_ino,
+                            &file.name,
+                            Some(account_id),
+                            Some(file_id),
+                        )?;
+                        self.notifier.notify_created(&file.name);
+                        stats.created += 1;
+                        info!(
+                            account = %account_id,
+                            name = %file.name,
+                            file_id,
+                            "Reconciled new remote cloud folder into local VFS"
+                        );
+                    } else {
+                        let size = file.size.as_ref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        let location = StorageLocation::SingleAccount {
+                            account_id: account_id.to_string(),
+                            google_file_id: file.id.clone(),
+                        };
 
-                    self.notifier.notify_created(&file.name);
-                    stats.created += 1;
-                    info!(
-                        account = %account_id,
-                        name = %file.name,
-                        "Reconciled new remote cloud file into local VFS"
-                    );
+                        let _ = self.routing_table.insert_file(NewFileParams {
+                            parent_ino,
+                            name: &file.name,
+                            size,
+                            mime_type: &file.mime_type,
+                            modified_time: 0,
+                            created_time: 0,
+                            location,
+                            web_view_link: None,
+                        })?;
+
+                        self.notifier.notify_created(&file.name);
+                        stats.created += 1;
+                        info!(
+                            account = %account_id,
+                            name = %file.name,
+                            "Reconciled new remote cloud file into local VFS"
+                        );
+                    }
                 }
             }
         }

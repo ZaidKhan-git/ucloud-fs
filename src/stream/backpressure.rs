@@ -10,10 +10,10 @@ pub struct MemoryBackpressureValve {
 }
 
 impl MemoryBackpressureValve {
-    /// Default global streaming RAM ceiling: 128 MB.
-    pub const DEFAULT_MAX_CEILING_BYTES: usize = 128 * 1024 * 1024;
+    /// Default global streaming RAM ceiling: 150 MB (accommodates high-bitrate video streaming buffers).
+    pub const DEFAULT_MAX_CEILING_BYTES: usize = 150 * 1024 * 1024;
 
-    /// Creates a valve with the default 128 MB ceiling.
+    /// Creates a valve with the default 150 MB ceiling.
     #[must_use]
     pub fn new() -> Self {
         Self::with_ceiling(Self::DEFAULT_MAX_CEILING_BYTES)

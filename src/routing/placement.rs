@@ -222,6 +222,14 @@ impl PlacementEngine {
         }
     }
 
+    /// Releases used bytes after a cloud file deletion.
+    pub fn release_used_bytes(&self, account_id: &str, bytes: u64) {
+        if let Some(acc) = self.accounts.get(account_id) {
+            let current = acc.used_bytes.load(Ordering::Relaxed);
+            acc.used_bytes.store(current.saturating_sub(bytes), Ordering::Relaxed);
+        }
+    }
+
     /// Returns the effective free space for a specific account.
     #[must_use]
     pub fn effective_free_space(&self, account_id: &str) -> Option<u64> {

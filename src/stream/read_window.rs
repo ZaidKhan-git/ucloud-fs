@@ -190,7 +190,7 @@ pub struct EphemeralReadHandle {
 }
 
 impl EphemeralReadHandle {
-    /// Default forward sliding window capacity: 8 MB.
+    /// Default forward sliding window capacity: 8 MB (smooth 1080p video streaming).
     pub const DEFAULT_FORWARD_CAPACITY: usize = 8 * 1024 * 1024;
     /// Default tail header slot capacity: 256 KB.
     pub const DEFAULT_TAIL_CAPACITY: usize = 256 * 1024;
@@ -221,7 +221,7 @@ impl EphemeralReadHandle {
         tail_capacity: usize,
     ) -> Result<Self, VfsError> {
         let total_needed = forward_capacity + tail_capacity;
-        let min_needed = (2 * 1024 * 1024) + tail_capacity;
+        let min_needed = (1024 * 1024) + tail_capacity;
 
         let reservation = valve
             .acquire_or_shrink(total_needed, min_needed)
@@ -302,24 +302,31 @@ impl EphemeralReadHandle {
         Ok(Bytes::copy_from_slice(&self.tail_buffer[start_idx..end_idx]))
     }
 
-    /// Serves sequential and small forward reads using the 8 MB sliding window.
+    /// Serves sequential and small forward reads using the sliding window with fast slice copying.
     async fn read_from_forward_window(&mut self, offset: u64, len: usize) -> Result<Bytes, VfsError> {
         let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
 
         // Check for Forward Cache Hit
         if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
-            // Evict all bytes prior to offset to free RAM immediately
-            let evict_len = (offset - self.forward_start_offset) as usize;
-            if evict_len > 0 {
-                self.forward_buffer.drain(..evict_len);
+            let rel_offset = (offset - self.forward_start_offset) as usize;
+            if rel_offset > 0 {
+                self.forward_buffer.drain(..rel_offset);
                 self.forward_start_offset = offset;
             }
 
-            let slice: Vec<u8> = self.forward_buffer.iter().take(len).copied().collect();
-            return Ok(Bytes::from(slice));
+            let copy_len = len.min(self.forward_buffer.len());
+            let (s1, s2) = self.forward_buffer.as_slices();
+            if copy_len <= s1.len() {
+                return Ok(Bytes::copy_from_slice(&s1[..copy_len]));
+            } else {
+                let mut out = Vec::with_capacity(copy_len);
+                out.extend_from_slice(s1);
+                out.extend_from_slice(&s2[..copy_len - s1.len()]);
+                return Ok(Bytes::from(out));
+            }
         }
 
-        // Forward Cache Miss: Clear old forward window and fetch fresh 8 MB window
+        // Forward Cache Miss: Clear old forward window
         self.forward_buffer.make_contiguous().fill(0);
         self.forward_buffer.clear();
 
@@ -338,8 +345,16 @@ impl EphemeralReadHandle {
         self.forward_buffer = VecDeque::from(fetched.to_vec());
         self.forward_start_offset = offset;
 
-        let slice: Vec<u8> = self.forward_buffer.iter().take(len).copied().collect();
-        Ok(Bytes::from(slice))
+        let copy_len = len.min(self.forward_buffer.len());
+        let (s1, s2) = self.forward_buffer.as_slices();
+        if copy_len <= s1.len() {
+            Ok(Bytes::copy_from_slice(&s1[..copy_len]))
+        } else {
+            let mut out = Vec::with_capacity(copy_len);
+            out.extend_from_slice(s1);
+            out.extend_from_slice(&s2[..copy_len - s1.len()]);
+            Ok(Bytes::from(out))
+        }
     }
 
     /// Total active heap RAM currently occupied by forward and tail buffers in bytes.

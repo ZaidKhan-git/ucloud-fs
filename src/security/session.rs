@@ -153,6 +153,8 @@ mod tests {
             refresh_token: "refresh_123".to_string(),
             access_token: "access_old".to_string(),
             expires_at_unix: now.elapsed().as_secs() + 5000,
+            client_id: None,
+            client_secret: None,
         };
         let mgr = Arc::new(AccountTokenManager::new(
             "test_user@gmail.com".to_string(),

@@ -10,18 +10,60 @@ pub trait ShellNotifier: Send + Sync {
 
 /// Windows Explorer shell notifier invoking `SHChangeNotify`.
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WindowsShellNotifier;
+#[derive(Debug, Clone)]
+pub struct WindowsShellNotifier {
+    mount_point: String,
+}
+
+#[cfg(windows)]
+impl Default for WindowsShellNotifier {
+    fn default() -> Self {
+        Self {
+            mount_point: "Y:".to_string(),
+        }
+    }
+}
 
 #[cfg(windows)]
 impl WindowsShellNotifier {
-    fn send_notification(event_id: u32, path: &str) {
+    #[must_use]
+    pub fn new(mount_point: &str) -> Self {
+        Self {
+            mount_point: mount_point.trim_end_matches(['\\', '/']).to_string(),
+        }
+    }
+
+    fn to_dos_path(&self, virtual_path: &str) -> String {
+        let clean = virtual_path.replace('/', "\\");
+        let trimmed = clean.trim_start_matches('\\');
+        if trimmed.is_empty() {
+            format!("{}\\", self.mount_point)
+        } else {
+            format!("{}\\{}", self.mount_point, trimmed)
+        }
+    }
+
+    fn parent_dos_path(&self, virtual_path: &str) -> String {
+        let clean = virtual_path.replace('/', "\\");
+        let trimmed = clean.trim_matches('\\');
+        if let Some((parent, _)) = trimmed.rsplit_once('\\') {
+            format!("{}\\{}", self.mount_point, parent)
+        } else {
+            format!("{}\\", self.mount_point)
+        }
+    }
+
+    fn send_raw(&self, event_id: u32, dos_path: &str) {
         use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        let wide: Vec<u16> = std::ffi::OsStr::new(dos_path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
 
+        // SAFETY: `wide` is a valid, null-terminated UTF-16 wide string encoding the virtual path.
+        // `SHCNF_PATHW` informs the shell that `dwItem1` points to a null-terminated UTF-16 path.
+        // `SHCNF_FLUSHNOWAIT` ensures the notification is posted asynchronously without blocking.
+        // `dwItem2` is null as not required for CREATE, DELETE, or UPDATE events.
         unsafe {
             windows_sys::Win32::UI::Shell::SHChangeNotify(
                 event_id as i32,
@@ -31,22 +73,29 @@ impl WindowsShellNotifier {
                 std::ptr::null(),
             );
         }
-        debug!(event_id, path, "Sent Windows SHChangeNotify");
+        debug!(event_id, dos_path, "Sent Windows SHChangeNotify");
     }
 }
 
 #[cfg(windows)]
 impl ShellNotifier for WindowsShellNotifier {
     fn notify_created(&self, path: &str) {
-        Self::send_notification(windows_sys::Win32::UI::Shell::SHCNE_CREATE, path);
+        let dos = self.to_dos_path(path);
+        let parent = self.parent_dos_path(path);
+        self.send_raw(windows_sys::Win32::UI::Shell::SHCNE_CREATE, &dos);
+        self.send_raw(windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR, &parent);
     }
 
     fn notify_deleted(&self, path: &str) {
-        Self::send_notification(windows_sys::Win32::UI::Shell::SHCNE_DELETE, path);
+        let dos = self.to_dos_path(path);
+        let parent = self.parent_dos_path(path);
+        self.send_raw(windows_sys::Win32::UI::Shell::SHCNE_DELETE, &dos);
+        self.send_raw(windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR, &parent);
     }
 
     fn notify_updated(&self, path: &str) {
-        Self::send_notification(windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR, path);
+        let dos = self.to_dos_path(path);
+        self.send_raw(windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR, &dos);
     }
 }
 

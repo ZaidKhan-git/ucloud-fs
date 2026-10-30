@@ -252,6 +252,8 @@ impl InMemoryRoutingTable {
                 if let (Some(acc), Some(gid)) = (account_id, google_folder_id) {
                     let mut entry = self.virtual_folders.entry(existing_ino).or_default();
                     entry.insert(acc.to_string(), gid.to_string());
+                    self.reverse_cloud_index
+                        .insert((acc.to_string(), gid.to_string()), existing_ino);
                 }
                 return Ok(existing_ino);
             }
@@ -269,6 +271,8 @@ impl InMemoryRoutingTable {
             let mut map = HashMap::new();
             map.insert(acc.to_string(), gid.to_string());
             self.virtual_folders.insert(ino, map);
+            self.reverse_cloud_index
+                .insert((acc.to_string(), gid.to_string()), ino);
         } else {
             self.virtual_folders.insert(ino, HashMap::new());
         }
@@ -298,6 +302,34 @@ impl InMemoryRoutingTable {
     pub fn record_remote_folder_id(&self, ino: u64, account_id: &str, google_folder_id: &str) {
         let mut entry = self.virtual_folders.entry(ino).or_default();
         entry.insert(account_id.to_string(), google_folder_id.to_string());
+        self.reverse_cloud_index
+            .insert((account_id.to_string(), google_folder_id.to_string()), ino);
+    }
+
+    /// Returns all remote Google folder IDs associated with an inode across all accounts.
+    #[must_use]
+    pub fn get_all_remote_folder_ids(&self, ino: u64) -> Vec<(String, String)> {
+        if let Some(guard) = self.virtual_folders.get(&ino) {
+            guard.value().iter().map(|(a, f)| (a.clone(), f.clone())).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Resolves the canonical virtual path (e.g. `/Folder/file.txt`) for any valid inode ID.
+    #[must_use]
+    pub fn get_path_for_inode(&self, mut ino: u64) -> Option<String> {
+        if ino == Self::ROOT_INO {
+            return Some("/".to_string());
+        }
+        let mut segments = Vec::new();
+        while ino != Self::ROOT_INO {
+            let node = self.inodes.get(&ino)?;
+            segments.push(node.name.clone());
+            ino = node.parent_ino;
+        }
+        segments.reverse();
+        Some(format!("/{}", segments.join("/")))
     }
 
     /// Looks up an inode by its cloud account ID and Google file ID.
@@ -414,7 +446,11 @@ impl InMemoryRoutingTable {
             StorageLocation::VirtualWarningNote { .. } | StorageLocation::VirtualDirectory => {}
         }
 
-        self.virtual_folders.remove(&target_ino);
+        if let Some((_, map)) = self.virtual_folders.remove(&target_ino) {
+            for (acc, gid) in map {
+                self.reverse_cloud_index.remove(&(acc, gid));
+            }
+        }
 
         Ok(removed_node)
     }

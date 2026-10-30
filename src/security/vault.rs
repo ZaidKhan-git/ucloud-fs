@@ -25,7 +25,10 @@ impl MemoryLockGuard {
         {
             let ptr = slice.as_ptr() as *mut std::ffi::c_void;
             let size = slice.len();
-            // VirtualLock informs the OS kernel to keep pages resident in physical RAM
+            // SAFETY: `slice` is a valid, contiguous byte slice in heap or stack memory
+            // allocated by this process. `VirtualLock` informs the Windows kernel to lock
+            // this memory range into the physical working set, preventing paging to pagefile.sys.
+            // If the OS call fails (e.g. working set quota exceeded), the memory is still safe to use.
             unsafe {
                 windows_sys::Win32::System::Memory::VirtualLock(ptr, size);
             }
@@ -42,6 +45,8 @@ impl MemoryLockGuard {
 impl Drop for MemoryLockGuard {
     fn drop(&mut self) {
         #[cfg(windows)]
+        // SAFETY: `self.ptr` and `self.size` correspond directly to the valid memory
+        // region previously locked via `VirtualLock` in `MemoryLockGuard::lock`.
         unsafe {
             windows_sys::Win32::System::Memory::VirtualUnlock(self.ptr, self.size);
         }
@@ -56,6 +61,10 @@ pub struct AccountCredentials {
     pub refresh_token: String,
     pub access_token: String,
     pub expires_at_unix: u64,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 impl fmt::Debug for AccountCredentials {
@@ -65,6 +74,8 @@ impl fmt::Debug for AccountCredentials {
             .field("refresh_token", &"[REDACTED]")
             .field("access_token", &"[REDACTED]")
             .field("expires_at_unix", &self.expires_at_unix)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -217,12 +228,16 @@ mod tests {
                 refresh_token: "1//refresh_token_alpha".to_string(),
                 access_token: "ya29.access_token_alpha".to_string(),
                 expires_at_unix: 1800000000,
+                client_id: None,
+                client_secret: None,
             },
             AccountCredentials {
                 account_id: "user2@gmail.com".to_string(),
                 refresh_token: "1//refresh_token_beta".to_string(),
                 access_token: "ya29.access_token_beta".to_string(),
                 expires_at_unix: 1800000000,
+                client_id: None,
+                client_secret: None,
             },
         ];
 
@@ -243,6 +258,8 @@ mod tests {
             refresh_token: "token".to_string(),
             access_token: "access".to_string(),
             expires_at_unix: 100,
+            client_id: None,
+            client_secret: None,
         }];
         let params = KeyDerivationParams::fast_test();
 
@@ -259,6 +276,8 @@ mod tests {
             refresh_token: "secret_refresh".to_string(),
             access_token: "secret_access".to_string(),
             expires_at_unix: 5000,
+            client_id: None,
+            client_secret: None,
         }];
         let passphrase = "fuzz_master_password";
         let params = KeyDerivationParams::fast_test();
