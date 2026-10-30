@@ -25,6 +25,10 @@ pub struct InMemoryRoutingTable {
     reverse_cloud_index: DashMap<(String, String), u64>,
     /// Virtual folders mapping: ino -> (account_id -> google_folder_id)
     virtual_folders: DashMap<u64, HashMap<String, String>>,
+    /// Track colliding base file names: (parent_ino, canonical_lookup_key(base_name)) -> original_base_name
+    collided_files: DashMap<(u64, String), String>,
+    /// Track colliding base directory names: (parent_ino, canonical_lookup_key(base_name)) -> original_base_name
+    collided_dirs: DashMap<(u64, String), String>,
     /// Monotonic 64-bit inode allocator (starts at 2; 1 is always `/`)
     next_ino: AtomicU64,
 }
@@ -41,6 +45,8 @@ impl InMemoryRoutingTable {
             lookup_by_name: DashMap::new(),
             reverse_cloud_index: DashMap::new(),
             virtual_folders: DashMap::new(),
+            collided_files: DashMap::new(),
+            collided_dirs: DashMap::new(),
             next_ino: AtomicU64::new(2),
         };
 
@@ -122,6 +128,68 @@ impl InMemoryRoutingTable {
         Ok(entries)
     }
 
+    /// Generates a clean abbreviation for an account ID:
+    /// e.g. "alice.work@gmail.com" -> "alice.work", "acc_b" -> "acc_b".
+    #[must_use]
+    pub fn account_abbreviation(account_id: &str) -> String {
+        let raw = if let Some(idx) = account_id.find('@') {
+            &account_id[..idx]
+        } else {
+            account_id
+        };
+        let clean: String = raw
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                _ => c,
+            })
+            .collect();
+        if clean.is_empty() {
+            "acc".to_string()
+        } else {
+            clean
+        }
+    }
+
+    /// Formats a filename or dirname with an account abbreviation and optional numeric counter:
+    /// e.g. "report.pdf", "alice", 1 -> "report (alice).pdf"
+    /// e.g. "report.pdf", "alice", 2 -> "report (alice_2).pdf"
+    #[must_use]
+    pub fn format_disambiguated_name(name: &str, abbr: &str, counter: usize) -> String {
+        let (stem, ext) = match name.rfind('.') {
+            Some(idx) if idx > 0 && idx < name.len() - 1 => (&name[..idx], Some(&name[idx + 1..])),
+            _ => (name, None),
+        };
+        let suffix = if counter <= 1 {
+            format!("({abbr})")
+        } else {
+            format!("({abbr}_{counter})")
+        };
+        match ext {
+            Some(e) => format!("{stem} {suffix}.{e}"),
+            None => format!("{stem} {suffix}"),
+        }
+    }
+
+    /// Returns the preferred account for an inode.
+    /// Walks up the directory tree to find the first ancestor with an associated cloud account.
+    #[must_use]
+    pub fn get_preferred_account_for_folder(&self, mut ino: u64) -> Option<String> {
+        while ino != Self::ROOT_INO {
+            if let Some(guard) = self.virtual_folders.get(&ino)
+                && let Some((acc, _)) = guard.value().iter().next()
+            {
+                return Some(acc.clone());
+            }
+            if let Some(node) = self.inodes.get(&ino) {
+                ino = node.parent_ino;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     /// Generates a deterministic disambiguated filename if collision exists:
     /// e.g. `img.jpg` on `acc_b` -> `img (acc_b).jpg`.
     #[must_use]
@@ -130,26 +198,10 @@ impl InMemoryRoutingTable {
             return name.to_string();
         }
 
-        let (stem, ext) = match name.rfind('.') {
-            Some(idx) if idx > 0 && idx < name.len() - 1 => (&name[..idx], Some(&name[idx + 1..])),
-            _ => (name, None),
-        };
-
-        let base_disambiguated = match ext {
-            Some(e) => format!("{stem} ({account_id}).{e}"),
-            None => format!("{stem} ({account_id})"),
-        };
-
-        if self.lookup(parent_ino, &base_disambiguated).is_none() {
-            return base_disambiguated;
-        }
-
-        let mut counter = 2;
+        let abbr = Self::account_abbreviation(account_id);
+        let mut counter = 1;
         loop {
-            let candidate = match ext {
-                Some(e) => format!("{stem} ({account_id}_{counter}).{e}"),
-                None => format!("{stem} ({account_id}_{counter})"),
-            };
+            let candidate = Self::format_disambiguated_name(name, &abbr, counter);
             if self.lookup(parent_ino, &candidate).is_none() {
                 return candidate;
             }
@@ -157,7 +209,7 @@ impl InMemoryRoutingTable {
         }
     }
 
-    /// Inserts a new virtual file under `parent_ino` with automatic collision resolution.
+    /// Inserts a new virtual file under `parent_ino` with automatic bidirectional collision resolution.
     pub fn insert_file(&self, params: NewFileParams<'_>) -> Result<u64, VfsError> {
         let account_id_for_disambiguation = match &params.location {
             StorageLocation::SingleAccount { account_id, .. } => account_id.as_str(),
@@ -168,11 +220,80 @@ impl InMemoryRoutingTable {
             _ => "cloud",
         };
 
-        let final_name = self.disambiguate_filename(
-            params.parent_ino,
-            params.name,
-            account_id_for_disambiguation,
-        );
+        let new_abbr = Self::account_abbreviation(account_id_for_disambiguation);
+        let canonical_base = canonical_lookup_key(params.name);
+        let base_key = (params.parent_ino, canonical_base.clone());
+
+        let final_name = if self.collided_files.contains_key(&base_key) {
+            // Base name already collided previously: suffix 3rd, 4th, or N-th account immediately
+            let mut counter = 1;
+            loop {
+                let candidate = Self::format_disambiguated_name(params.name, &new_abbr, counter);
+                if self.lookup(params.parent_ino, &candidate).is_none() {
+                    break candidate;
+                }
+                counter += 1;
+            }
+        } else if let Some(existing_ino) = self.lookup(params.parent_ino, params.name) {
+            // Collision detected! Check if existing file is from a different account
+            let existing_acc_opt = self.get_inode(existing_ino).and_then(|node| match &node.location {
+                StorageLocation::SingleAccount { account_id, .. } => Some(account_id.clone()),
+                StorageLocation::StripedManifest { manifest_account_id, .. } => Some(manifest_account_id.clone()),
+                _ => None,
+            });
+
+            if let Some(existing_acc) = existing_acc_opt {
+                if existing_acc != account_id_for_disambiguation {
+                    // Cross-account collision: Bidirectionally rename existing file and suffix new file!
+                    self.collided_files.insert(base_key.clone(), params.name.to_string());
+
+                    let old_abbr = Self::account_abbreviation(&existing_acc);
+                    let mut old_counter = 1;
+                    let old_disambiguated = loop {
+                        let candidate = Self::format_disambiguated_name(params.name, &old_abbr, old_counter);
+                        if self.lookup(params.parent_ino, &candidate).is_none() {
+                            break candidate;
+                        }
+                        old_counter += 1;
+                    };
+
+                    // Rename existing file in lookup_by_name and inodes (Strict Single-Guard discipline)
+                    self.lookup_by_name.remove(&base_key);
+                    self.lookup_by_name.insert(
+                        (params.parent_ino, canonical_lookup_key(&old_disambiguated)),
+                        existing_ino,
+                    );
+                    if let Some(mut existing_node) = self.inodes.get_mut(&existing_ino) {
+                        existing_node.name = old_disambiguated;
+                    }
+
+                    // Compute disambiguated name for the new incoming file
+                    let mut new_counter = 1;
+                    loop {
+                        let candidate = Self::format_disambiguated_name(params.name, &new_abbr, new_counter);
+                        if self.lookup(params.parent_ino, &candidate).is_none() {
+                            break candidate;
+                        }
+                        new_counter += 1;
+                    }
+                } else {
+                    // Same account collision: suffix new file with numeric increment
+                    let mut counter = 2;
+                    loop {
+                        let candidate = Self::format_disambiguated_name(params.name, &new_abbr, counter);
+                        if self.lookup(params.parent_ino, &candidate).is_none() {
+                            break candidate;
+                        }
+                        counter += 1;
+                    }
+                }
+            } else {
+                params.name.to_string()
+            }
+        } else {
+            params.name.to_string()
+        };
+
         let ino = self.allocate_ino();
         let is_workspace_doc = VirtualInode::is_google_workspace_mime(params.mime_type);
 
@@ -230,8 +351,9 @@ impl InMemoryRoutingTable {
 
     /// Inserts a directory under `parent_ino`.
     ///
-    /// If a directory with the same name already exists, merges transparently into the existing
-    /// virtual directory and records the Google folder ID for this account.
+    /// If directories with the same name arrive from different accounts, bidirectionally disambiguates
+    /// them with their account abbreviations (e.g. `Projects (alice)` and `Projects (bob)`).
+    /// Transparently merges directories without account affiliation (e.g. local `mkdir`) or within the same account.
     pub fn insert_or_merge_directory(
         &self,
         parent_ino: u64,
@@ -239,22 +361,131 @@ impl InMemoryRoutingTable {
         account_id: Option<&str>,
         google_folder_id: Option<&str>,
     ) -> Result<u64, VfsError> {
-        if let Some(existing_ino) = self.lookup(parent_ino, name) {
-            let is_dir = {
-                let guard = self
+        let canonical_base = canonical_lookup_key(name);
+        let base_key = (parent_ino, canonical_base.clone());
+
+        if let Some(acc_new) = account_id {
+            let new_abbr = Self::account_abbreviation(acc_new);
+
+            if self.collided_dirs.contains_key(&base_key) {
+                // Already collided: create with disambiguated name
+                let mut counter = 1;
+                let final_dir_name = loop {
+                    let candidate = Self::format_disambiguated_name(name, &new_abbr, counter);
+                    if self.lookup(parent_ino, &candidate).is_none() {
+                        break candidate;
+                    }
+                    counter += 1;
+                };
+
+                let ino = self.allocate_ino();
+                let dir_node = VirtualInode::new_directory(ino, parent_ino, final_dir_name.clone());
+                self.inodes.insert(ino, dir_node);
+                self.lookup_by_name
+                    .insert((parent_ino, canonical_lookup_key(&final_dir_name)), ino);
+
+                let mut map = HashMap::new();
+                if let Some(gid) = google_folder_id {
+                    map.insert(acc_new.to_string(), gid.to_string());
+                    self.reverse_cloud_index
+                        .insert((acc_new.to_string(), gid.to_string()), ino);
+                }
+                self.virtual_folders.insert(ino, map);
+
+                if let Some(mut p) = self.inodes.get_mut(&parent_ino) {
+                    p.children.push(ino);
+                }
+
+                return Ok(ino);
+            }
+
+            if let Some(existing_ino) = self.lookup(parent_ino, name) {
+                let is_dir = self
                     .inodes
                     .get(&existing_ino)
-                    .ok_or_else(|| VfsError::NotFound("Inconsistent inode lookup".to_string()))?;
-                guard.is_directory
-            };
+                    .map(|g| g.is_directory)
+                    .unwrap_or(false);
 
-            if is_dir {
-                if let (Some(acc), Some(gid)) = (account_id, google_folder_id) {
-                    let mut entry = self.virtual_folders.entry(existing_ino).or_default();
-                    entry.insert(acc.to_string(), gid.to_string());
-                    self.reverse_cloud_index
-                        .insert((acc.to_string(), gid.to_string()), existing_ino);
+                if is_dir {
+                    let existing_accounts: Vec<String> = self
+                        .virtual_folders
+                        .get(&existing_ino)
+                        .map(|g| g.value().keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    if !existing_accounts.is_empty() && !existing_accounts.iter().any(|a| a == acc_new) {
+                        // Cross-account folder collision! Bidirectionally disambiguate
+                        self.collided_dirs.insert(base_key.clone(), name.to_string());
+
+                        let old_acc = &existing_accounts[0];
+                        let old_abbr = Self::account_abbreviation(old_acc);
+                        let mut old_counter = 1;
+                        let old_disambiguated = loop {
+                            let candidate = Self::format_disambiguated_name(name, &old_abbr, old_counter);
+                            if self.lookup(parent_ino, &candidate).is_none() {
+                                break candidate;
+                            }
+                            old_counter += 1;
+                        };
+
+                        // Rename existing directory (Strict Single-Guard discipline)
+                        self.lookup_by_name.remove(&base_key);
+                        self.lookup_by_name.insert(
+                            (parent_ino, canonical_lookup_key(&old_disambiguated)),
+                            existing_ino,
+                        );
+                        if let Some(mut existing_node) = self.inodes.get_mut(&existing_ino) {
+                            existing_node.name = old_disambiguated;
+                        }
+
+                        // Create new directory for acc_new
+                        let mut new_counter = 1;
+                        let new_disambiguated = loop {
+                            let candidate = Self::format_disambiguated_name(name, &new_abbr, new_counter);
+                            if self.lookup(parent_ino, &candidate).is_none() {
+                                break candidate;
+                            }
+                            new_counter += 1;
+                        };
+
+                        let ino = self.allocate_ino();
+                        let dir_node = VirtualInode::new_directory(ino, parent_ino, new_disambiguated.clone());
+                        self.inodes.insert(ino, dir_node);
+                        self.lookup_by_name
+                            .insert((parent_ino, canonical_lookup_key(&new_disambiguated)), ino);
+
+                        let mut map = HashMap::new();
+                        if let Some(gid) = google_folder_id {
+                            map.insert(acc_new.to_string(), gid.to_string());
+                            self.reverse_cloud_index
+                                .insert((acc_new.to_string(), gid.to_string()), ino);
+                        }
+                        self.virtual_folders.insert(ino, map);
+
+                        if let Some(mut p) = self.inodes.get_mut(&parent_ino) {
+                            p.children.push(ino);
+                        }
+
+                        return Ok(ino);
+                    }
+
+                    // Same account or unassigned local directory -> merge
+                    if let Some(gid) = google_folder_id {
+                        let mut entry = self.virtual_folders.entry(existing_ino).or_default();
+                        entry.insert(acc_new.to_string(), gid.to_string());
+                        self.reverse_cloud_index
+                            .insert((acc_new.to_string(), gid.to_string()), existing_ino);
+                    }
+                    return Ok(existing_ino);
                 }
+            }
+        } else if let Some(existing_ino) = self.lookup(parent_ino, name) {
+            let is_dir = self
+                .inodes
+                .get(&existing_ino)
+                .map(|g| g.is_directory)
+                .unwrap_or(false);
+            if is_dir {
                 return Ok(existing_ino);
             }
         }
@@ -277,10 +508,8 @@ impl InMemoryRoutingTable {
             self.virtual_folders.insert(ino, HashMap::new());
         }
 
-        {
-            if let Some(mut p) = self.inodes.get_mut(&parent_ino) {
-                p.children.push(ino);
-            }
+        if let Some(mut p) = self.inodes.get_mut(&parent_ino) {
+            p.children.push(ino);
         }
 
         Ok(ino)
@@ -565,6 +794,8 @@ impl InMemoryRoutingTable {
         self.lookup_by_name.clear();
         self.reverse_cloud_index.clear();
         self.virtual_folders.clear();
+        self.collided_files.clear();
+        self.collided_dirs.clear();
         self.next_ino.store(2, Ordering::SeqCst);
 
         // Recreate root
@@ -632,9 +863,14 @@ mod tests {
             )
             .unwrap();
 
-        // Both accounts must map to the exact same merged virtual directory inode
-        assert_eq!(dir_a, dir_b);
-        assert_eq!(table.count(), 2); // Root + /Photos
+        // Cross-account folder collision: both directories are disambiguated with account abbreviations
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(table.count(), 3); // Root + /Photos (acc_a) + /Photos (acc_b)
+
+        let node_a = table.get_inode(dir_a).unwrap();
+        let node_b = table.get_inode(dir_b).unwrap();
+        assert_eq!(node_a.name, "Photos (acc_a)");
+        assert_eq!(node_b.name, "Photos (acc_b)");
 
         // Verify folder IDs for both accounts are tracked
         assert_eq!(
@@ -642,9 +878,18 @@ mod tests {
             Some("f_acc_a".to_string())
         );
         assert_eq!(
-            table.get_remote_folder_id(dir_a, "acc_b"),
+            table.get_remote_folder_id(dir_b, "acc_b"),
             Some("f_acc_b".to_string())
         );
+
+        // Verify local directories merge without account affiliation
+        let local_1 = table
+            .insert_or_merge_directory(InMemoryRoutingTable::ROOT_INO, "LocalShared", None, None)
+            .unwrap();
+        let local_2 = table
+            .insert_or_merge_directory(InMemoryRoutingTable::ROOT_INO, "LocalShared", None, None)
+            .unwrap();
+        assert_eq!(local_1, local_2);
     }
 
     #[test]
@@ -672,7 +917,7 @@ mod tests {
             })
             .unwrap();
 
-        // Account B inserts /Docs/report.pdf -> should disambiguate to "report (acc_b).pdf"
+        // Account B inserts /Docs/report.pdf -> should bidirectionally disambiguate BOTH to (acc_a) and (acc_b)
         let f2 = table
             .insert_file(NewFileParams {
                 parent_ino: dir_ino,
@@ -694,15 +939,33 @@ mod tests {
         let node1 = table.get_inode(f1).unwrap();
         let node2 = table.get_inode(f2).unwrap();
 
-        assert_eq!(node1.name, "report.pdf");
+        assert_eq!(node1.name, "report (acc_a).pdf");
         assert_eq!(node2.name, "report (acc_b).pdf");
 
-        // Verify resolve_path finds both
-        assert_eq!(table.resolve_path("/Docs/report.pdf").unwrap(), f1);
-        assert_eq!(
-            table.resolve_path("/Docs/report (acc_b).pdf").unwrap(),
-            f2
-        );
+        // Account C (3rd account) inserts /Docs/report.pdf -> recognizes base name collision and becomes (acc_c)
+        let f3 = table
+            .insert_file(NewFileParams {
+                parent_ino: dir_ino,
+                name: "report.pdf",
+                size: 3072,
+                mime_type: "application/pdf",
+                modified_time: 300,
+                created_time: 300,
+                location: StorageLocation::SingleAccount {
+                    account_id: "acc_c".to_string(),
+                    google_file_id: "g3".to_string(),
+                },
+                web_view_link: None,
+            })
+            .unwrap();
+
+        let node3 = table.get_inode(f3).unwrap();
+        assert_eq!(node3.name, "report (acc_c).pdf");
+
+        // Verify resolve_path finds all three files
+        assert_eq!(table.resolve_path("/Docs/report (acc_a).pdf").unwrap(), f1);
+        assert_eq!(table.resolve_path("/Docs/report (acc_b).pdf").unwrap(), f2);
+        assert_eq!(table.resolve_path("/Docs/report (acc_c).pdf").unwrap(), f3);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -21,8 +21,7 @@ use crate::routing::InMemoryRoutingTable;
 use crate::security::session::SessionController;
 use crate::stream::backpressure::MemoryBackpressureValve;
 use crate::stream::read_window::{
-    ByteSource, CachedByteSource, EphemeralReadHandle, MockByteSource, SharedInodeBlockCache,
-    SingleAccountByteSource, StripedManifestByteSource,
+    ByteSource, MockByteSource, SingleAccountByteSource, StripedManifestByteSource,
 };
 use crate::stream::write_spool::EphemeralWriteHandle;
 use crate::vfs::notify::ShellNotifier;
@@ -81,19 +80,406 @@ struct WritePendingState {
     striped_plan: Option<StripedPlacementPlan>,
     uploaded_bytes: Vec<u8>,
     delete_on_close: bool,
+    preferred_account: Option<String>,
+    overwriting_existing: Option<(u64, String, String)>,
+}
+
+/// Block size for the shared inode page cache (1 MB aligned blocks).
+pub const SHARED_BLOCK_SIZE: u64 = 1024 * 1024;
+/// Maximum number of blocks stored in the shared inode page cache (96 MB LRU ceiling).
+pub const MAX_SHARED_BLOCKS: usize = 96;
+
+/// Shared Inode Page Cache dividing files into 1 MB blocks with LRU eviction and single-flight deduplication.
+pub struct SharedBlockCache {
+    blocks: DashMap<(u64, u64), (Instant, Bytes)>,
+    in_flight: DashMap<(u64, u64), tokio::sync::broadcast::Sender<Bytes>>,
+    max_blocks: usize,
+}
+
+impl Default for SharedBlockCache {
+    fn default() -> Self {
+        Self::new(MAX_SHARED_BLOCKS)
+    }
+}
+
+impl SharedBlockCache {
+    #[must_use]
+    pub fn new(max_blocks: usize) -> Self {
+        Self {
+            blocks: DashMap::new(),
+            in_flight: DashMap::new(),
+            max_blocks: max_blocks.max(1),
+        }
+    }
+
+    /// Retrieves a block from cache if present, updating its LRU access timestamp.
+    #[must_use]
+    pub fn get(&self, ino: u64, block_index: u64) -> Option<Bytes> {
+        if let Some(mut entry) = self.blocks.get_mut(&(ino, block_index)) {
+            entry.0 = Instant::now();
+            Some(entry.1.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether a block is currently resident in cache.
+    #[must_use]
+    pub fn contains(&self, ino: u64, block_index: u64) -> bool {
+        self.blocks.contains_key(&(ino, block_index))
+    }
+
+    /// Inserts a block into cache with LRU eviction when reaching capacity.
+    pub fn insert(&self, ino: u64, block_index: u64, bytes: Bytes) {
+        if self.blocks.contains_key(&(ino, block_index)) {
+            self.blocks.insert((ino, block_index), (Instant::now(), bytes));
+            return;
+        }
+
+        if self.blocks.len() >= self.max_blocks {
+            let oldest_key = self
+                .blocks
+                .iter()
+                .min_by_key(|entry| entry.value().0)
+                .map(|entry| *entry.key());
+
+            if let Some(key) = oldest_key {
+                self.blocks.remove(&key);
+            }
+        }
+
+        self.blocks.insert((ino, block_index), (Instant::now(), bytes));
+    }
+
+    /// Gets a block from cache or fetches it with single-flight deduplication across handles.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        ino: u64,
+        block_index: u64,
+        fetch_fut: F,
+    ) -> Result<Bytes, VfsError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Bytes, VfsError>>,
+    {
+        if let Some(bytes) = self.get(ino, block_index) {
+            return Ok(bytes);
+        }
+
+        enum FlightStatus {
+            Leader(tokio::sync::broadcast::Sender<Bytes>),
+            Follower(tokio::sync::broadcast::Receiver<Bytes>),
+        }
+
+        let flight_status = {
+            use dashmap::mapref::entry::Entry;
+            match self.in_flight.entry((ino, block_index)) {
+                Entry::Occupied(occ) => FlightStatus::Follower(occ.get().subscribe()),
+                Entry::Vacant(vac) => {
+                    let (tx, _) = tokio::sync::broadcast::channel(1);
+                    vac.insert(tx.clone());
+                    FlightStatus::Leader(tx)
+                }
+            }
+        };
+
+        match flight_status {
+            FlightStatus::Follower(mut rx) => match rx.recv().await {
+                Ok(bytes) => Ok(bytes),
+                Err(_) => {
+                    if let Some(bytes) = self.get(ino, block_index) {
+                        Ok(bytes)
+                    } else {
+                        let bytes = fetch_fut().await?;
+                        self.insert(ino, block_index, bytes.clone());
+                        Ok(bytes)
+                    }
+                }
+            },
+            FlightStatus::Leader(tx) => {
+                let res = fetch_fut().await;
+                self.in_flight.remove(&(ino, block_index));
+                match res {
+                    Ok(bytes) => {
+                        self.insert(ino, block_index, bytes.clone());
+                        let _ = tx.send(bytes.clone());
+                        Ok(bytes)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    /// Clears all cached blocks and in-flight tracking.
+    pub fn clear(&self) {
+        self.blocks.clear();
+        self.in_flight.clear();
+    }
+
+    /// Number of cached blocks currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Returns whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// Direct page-cache byte source with 1 MB aligned blocks, smart tail-seek awareness,
+/// lock-free parallel reads, and paced sequential background read-ahead.
+pub struct CachedByteSource {
+    pub ino: u64,
+    pub file_size: u64,
+    pub inner: Arc<dyn ByteSource>,
+    pub cache: Arc<SharedBlockCache>,
+    pub hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
+    pub rt_handle: tokio::runtime::Handle,
+    pub prefetch_sem: Arc<tokio::sync::Semaphore>,
+    pub active_cursor: Arc<AtomicU64>,
+}
+
+impl CachedByteSource {
+    #[must_use]
+    pub fn new(
+        ino: u64,
+        file_size: u64,
+        inner: Arc<dyn ByteSource>,
+        cache: Arc<SharedBlockCache>,
+        hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
+        rt_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            ino,
+            file_size,
+            inner,
+            cache,
+            hot_header_cache,
+            rt_handle,
+            prefetch_sem: Arc::new(tokio::sync::Semaphore::new(2)),
+            active_cursor: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Fetches a single 1 MB block from cache or network with single-flight deduplication.
+    pub async fn get_or_fetch_block(&self, block_index: u64) -> Result<Bytes, VfsError> {
+        if let Some(bytes) = self.cache.get(self.ino, block_index) {
+            return Ok(bytes);
+        }
+
+        let b_start = block_index * SHARED_BLOCK_SIZE;
+        if b_start >= self.file_size {
+            return Ok(Bytes::new());
+        }
+        let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
+            .min(self.file_size)
+            .saturating_sub(1);
+
+        let inner = Arc::clone(&self.inner);
+        self.cache
+            .get_or_fetch(self.ino, block_index, move || async move {
+                inner.fetch_range(b_start, b_end).await
+            })
+            .await
+    }
+
+    /// Spawns paced background read-ahead tasks (keeping 8 blocks ahead, at most 2 concurrent per inode).
+    pub fn trigger_paced_readahead(&self, current_block: u64) {
+        let max_block = self.file_size.saturating_sub(1) / SHARED_BLOCK_SIZE;
+        let target_start = current_block + 1;
+        let target_end = (current_block + 8).min(max_block);
+        if target_start > target_end {
+            return;
+        }
+
+        self.active_cursor.store(current_block, Ordering::SeqCst);
+
+        for next_b in target_start..=target_end {
+            if self.cache.contains(self.ino, next_b) {
+                continue;
+            }
+
+            let ino = self.ino;
+            let file_size = self.file_size;
+            let inner = Arc::clone(&self.inner);
+            let cache = Arc::clone(&self.cache);
+            let sem = Arc::clone(&self.prefetch_sem);
+            let cursor = Arc::clone(&self.active_cursor);
+
+            self.rt_handle.spawn(async move {
+                // If cursor moved away due to a seek, abort prefetch early
+                let cur = cursor.load(Ordering::SeqCst);
+                if next_b < cur || next_b > cur + 10 {
+                    return;
+                }
+
+                // Acquire permit: ensures at most 2 concurrent prefetch tasks per inode
+                let Ok(permit) = sem.acquire_owned().await else {
+                    return;
+                };
+
+                // Re-check after waiting for permit
+                let cur = cursor.load(Ordering::SeqCst);
+                if next_b < cur || next_b > cur + 10 || cache.contains(ino, next_b) {
+                    return;
+                }
+
+                let b_start = next_b * SHARED_BLOCK_SIZE;
+                if b_start < file_size {
+                    let b_end = ((next_b + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
+                    let _ = cache
+                        .get_or_fetch(ino, next_b, move || async move {
+                            inner.fetch_range(b_start, b_end).await
+                        })
+                        .await;
+                }
+
+                drop(permit);
+            });
+        }
+    }
+
+    /// Fetches an exact byte range directly and lock-free for OS ReadFile requests.
+    pub async fn fetch_range(&self, offset: u64, length: usize) -> Result<Bytes, VfsError> {
+        let file_size = self.file_size;
+        if offset >= file_size || length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let req_len = (length as u64).min(file_size - offset) as usize;
+
+        // 1. Check Hot Header Cache for head slice (<512 KB, 30s TTL)
+        if offset + req_len as u64 <= 512 * 1024
+            && let Some(entry) = self.hot_header_cache.get(&self.ino)
+            && entry.timestamp.elapsed() < Duration::from_secs(30)
+            && let Some(head) = &entry.head
+        {
+            let off = offset as usize;
+            if off + req_len <= head.len() {
+                debug!(ino = self.ino, offset, req_len, "Hot Header Cache head hit (<0.001 ms)");
+                self.trigger_paced_readahead(0);
+                return Ok(Bytes::copy_from_slice(&head[off..off + req_len]));
+            }
+        }
+
+        // 2. Check Hot Header Cache for tail slice
+        if let Some(entry) = self.hot_header_cache.get(&self.ino)
+            && entry.timestamp.elapsed() < Duration::from_secs(30)
+            && let Some((tail_start, tail_bytes)) = &entry.tail
+        {
+            let t_start = *tail_start;
+            let t_end = t_start + tail_bytes.len() as u64;
+            if offset >= t_start && offset + req_len as u64 <= t_end {
+                let off = (offset - t_start) as usize;
+                debug!(ino = self.ino, offset, req_len, "Hot Header Cache tail hit (<0.001 ms)");
+                return Ok(Bytes::copy_from_slice(&tail_bytes[off..off + req_len]));
+            }
+        }
+
+        let inclusive_end = offset + req_len as u64 - 1;
+        let start_block = offset / SHARED_BLOCK_SIZE;
+        let end_block = inclusive_end / SHARED_BLOCK_SIZE;
+
+        // Check if offset is in the Tail Zone (final 4 MB of a file > 16 MB)
+        let is_tail_zone = file_size > 16 * 1024 * 1024
+            && offset >= file_size.saturating_sub(4 * 1024 * 1024);
+
+        let is_cache_hit = self.cache.contains(self.ino, start_block);
+
+        // On a Cache Hit for forward stream: immediately trigger paced read-ahead
+        if !is_tail_zone && is_cache_hit {
+            self.trigger_paced_readahead(end_block);
+        }
+
+        // Fetch required block(s)
+        let mut assembled = Vec::with_capacity(req_len);
+
+        for b in start_block..=end_block {
+            let block_bytes = self.get_or_fetch_block(b).await?;
+            let b_start = b * SHARED_BLOCK_SIZE;
+            let b_end = ((b + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
+
+            let overlap_start = offset.max(b_start);
+            let overlap_end = inclusive_end.min(b_end);
+
+            if overlap_start <= overlap_end {
+                let rel_start = (overlap_start - b_start) as usize;
+                let rel_end = (overlap_end - b_start + 1) as usize;
+                if rel_start < block_bytes.len() {
+                    let slice_end = rel_end.min(block_bytes.len());
+                    assembled.extend_from_slice(&block_bytes[rel_start..slice_end]);
+                }
+            }
+        }
+
+        // On a Cache Miss for forward stream: foreground finished; now trigger paced read-ahead
+        if !is_tail_zone && !is_cache_hit {
+            self.trigger_paced_readahead(end_block);
+        }
+
+        // Populate Hot Header Cache for head (if reading from offset 0)
+        if offset == 0 && !assembled.is_empty() {
+            let head_len = (512 * 1024).min(assembled.len());
+            let head_bytes = Bytes::copy_from_slice(&assembled[..head_len]);
+            let mut entry = self.hot_header_cache.entry(self.ino).or_insert_with(|| HotHeaderCacheEntry {
+                head: None,
+                tail: None,
+                timestamp: Instant::now(),
+            });
+            entry.head = Some(head_bytes);
+            entry.timestamp = Instant::now();
+        }
+
+        // Populate Hot Header Cache for tail (if in tail zone)
+        if is_tail_zone && !assembled.is_empty() {
+            let mut entry = self.hot_header_cache.entry(self.ino).or_insert_with(|| HotHeaderCacheEntry {
+                head: None,
+                tail: None,
+                timestamp: Instant::now(),
+            });
+            entry.tail = Some((offset, Bytes::copy_from_slice(&assembled)));
+            entry.timestamp = Instant::now();
+        }
+
+        Ok(Bytes::from(assembled))
+    }
+}
+
+impl ByteSource for CachedByteSource {
+    fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    fn fetch_range<'a>(
+        &'a self,
+        start: u64,
+        end: u64,
+    ) -> crate::stream::read_window::BoxFuture<'a, Result<Bytes, VfsError>> {
+        let length = (end.saturating_sub(start) + 1) as usize;
+        Box::pin(self.fetch_range(start, length))
+    }
 }
 
 /// In-flight state of an open file or directory handle.
+#[derive(Clone)]
 enum HandleState {
     Directory {
         #[allow(dead_code)]
         ino: u64,
     },
-    Read {
+    ReadShared {
         ino: u64,
-        handle: Box<EphemeralReadHandle>,
+        source: Arc<CachedByteSource>,
     },
-    WritePending(Box<WritePendingState>),
+    ReadVirtual {
+        ino: u64,
+        bytes: Bytes,
+    },
+    WritePending(Arc<Mutex<WritePendingState>>),
 }
 
 /// Hot Header Cache entry storing initial 512 KB and tail 512 KB of recently accessed files.
@@ -115,6 +501,7 @@ pub struct DriverDependencies {
     pub prompter: Arc<dyn ChunkPrompter>,
     pub valve: Arc<MemoryBackpressureValve>,
     pub rt_handle: tokio::runtime::Handle,
+    pub volume_label: Option<String>,
 }
 
 /// Unified sandboxed VFS Driver bridging OS filesystem IRPs into the core ucloud-fs engine.
@@ -128,12 +515,13 @@ pub struct UcloudFsDriver {
     prompter: Arc<dyn ChunkPrompter>,
     valve: Arc<MemoryBackpressureValve>,
     rt_handle: tokio::runtime::Handle,
-    open_handles: DashMap<u64, Arc<Mutex<HandleState>>>,
+    open_handles: DashMap<u64, HandleState>,
     next_fh: AtomicU64,
     account_tokens: DashMap<String, String>,
     mock_files: DashMap<String, Bytes>,
-    pub hot_header_cache: DashMap<u64, HotHeaderCacheEntry>,
-    pub shared_block_cache: Arc<SharedInodeBlockCache>,
+    pub hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
+    pub shared_block_cache: Arc<SharedBlockCache>,
+    volume_label: RwLock<String>,
     is_mounted: AtomicBool,
 }
 
@@ -155,10 +543,37 @@ impl UcloudFsDriver {
             next_fh: AtomicU64::new(100),
             account_tokens: DashMap::new(),
             mock_files: DashMap::new(),
-            hot_header_cache: DashMap::new(),
-            shared_block_cache: Arc::new(SharedInodeBlockCache::default()),
+            hot_header_cache: Arc::new(DashMap::new()),
+            shared_block_cache: Arc::new(SharedBlockCache::default()),
+            volume_label: RwLock::new(
+                deps.volume_label.unwrap_or_else(|| "ucloud".to_string()),
+            ),
             is_mounted: AtomicBool::new(true),
         }
+    }
+
+    /// Sets a new volume label dynamically (e.g. from Windows Explorer rename).
+    pub fn set_volume_label(&self, label: &str) {
+        if let Ok(mut guard) = self.volume_label.write() {
+            *guard = label.to_string();
+        }
+    }
+
+    /// Retrieves the current volume label.
+    #[must_use]
+    pub fn get_volume_label(&self) -> String {
+        self.volume_label
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// Dynamically registers a newly added Google account into the live driver,
+    /// updating routing tables, token cache, and placement engine storage quotas.
+    pub fn register_account(&self, account_id: &str, token: &str, limit_bytes: u64, used_bytes: u64) {
+        self.set_account_token(account_id, token);
+        self.placement_engine.register_account(account_id, limit_bytes, used_bytes);
+        info!(account = %account_id, limit_bytes, used_bytes, "Dynamically registered new account in driver");
     }
 
     /// Registers an OAuth token for a linked Google account.
@@ -235,7 +650,7 @@ impl UcloudFsDriver {
                 unicode_on_disk: true,
                 reparse_points: false,
                 operation_timeout_ms: 300_000,
-                volume_label: "ucloud-fs".to_string(),
+                volume_label: self.get_volume_label(),
             })
         })
     }
@@ -325,7 +740,7 @@ impl UcloudFsDriver {
                     file_attributes: FILE_ATTRIBUTE_DIRECTORY,
                 })
             }
-            HandleState::Read { ino, .. } => {
+            HandleState::ReadShared { ino, .. } | HandleState::ReadVirtual { ino, .. } => {
                 let node = self
                     .routing_table
                     .get_inode(*ino)
@@ -346,7 +761,8 @@ impl UcloudFsDriver {
                     file_attributes: attributes,
                 })
             }
-            HandleState::WritePending(wp) => {
+            HandleState::WritePending(wp_mutex) => {
+                let wp = wp_mutex.try_lock().map_err(|_| VfsError::InternalFault("Write handle busy".to_string()))?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -373,20 +789,67 @@ impl UcloudFsDriver {
 
     /// Retrieves file information for an active open handle, with instantaneous non-blocking fast path.
     pub fn get_file_info_by_handle(&self, fh: u64) -> Result<FileInfo, VfsError> {
-        let handle_arc = self
+        let handle_state = self
             .open_handles
             .get(&fh)
-            .map(|g| Arc::clone(g.value()))
+            .map(|g| g.value().clone())
             .ok_or_else(|| VfsError::NotFound(format!("File handle {fh} not found")))?;
 
-        if let Ok(state) = handle_arc.try_lock() {
-            return self.file_info_from_handle_state(fh, &state);
+        match &handle_state {
+            HandleState::Directory { .. }
+            | HandleState::ReadShared { .. }
+            | HandleState::ReadVirtual { .. } => {
+                self.file_info_from_handle_state(fh, &handle_state)
+            }
+            HandleState::WritePending(wp_mutex) => {
+                if let Ok(wp) = wp_mutex.try_lock() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let size = if let Some(spool) = &wp.write_spool {
+                        spool.flushed_bytes() + spool.current_ram_usage() as u64
+                    } else {
+                        wp.uploaded_bytes.len() as u64
+                    };
+                    let alloc = size.max(wp.allocation_size);
+                    Ok(FileInfo {
+                        ino: fh,
+                        size,
+                        allocation_size: alloc,
+                        is_directory: false,
+                        is_readonly: false,
+                        created_time: now,
+                        modified_time: now,
+                        file_attributes: FILE_ATTRIBUTE_NORMAL,
+                    })
+                } else {
+                    self.execute_vfs_async_op(None, || async {
+                        let wp = wp_mutex.lock().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let size = if let Some(spool) = &wp.write_spool {
+                            spool.flushed_bytes() + spool.current_ram_usage() as u64
+                        } else {
+                            wp.uploaded_bytes.len() as u64
+                        };
+                        let alloc = size.max(wp.allocation_size);
+                        Ok(FileInfo {
+                            ino: fh,
+                            size,
+                            allocation_size: alloc,
+                            is_directory: false,
+                            is_readonly: false,
+                            created_time: now,
+                            modified_time: now,
+                            file_attributes: FILE_ATTRIBUTE_NORMAL,
+                        })
+                    })
+                }
+            }
         }
-
-        self.execute_vfs_async_op(None, || async {
-            let state = handle_arc.lock().await;
-            self.file_info_from_handle_state(fh, &state)
-        })
     }
 
     /// Opens an existing file for reading.
@@ -400,8 +863,7 @@ impl UcloudFsDriver {
 
             if node.is_directory {
                 let fh = self.allocate_fh();
-                self.open_handles
-                    .insert(fh, Arc::new(Mutex::new(HandleState::Directory { ino })));
+                self.open_handles.insert(fh, HandleState::Directory { ino });
                 return Ok(fh);
             }
 
@@ -463,7 +925,17 @@ impl UcloudFsDriver {
                         ))
                     }
                     StorageLocation::VirtualWarningNote { content, .. } => {
-                        Arc::new(MockByteSource::new(Bytes::from(content.clone())))
+                        let fh = self.allocate_fh();
+                        let _ = self.sync_engine.register_open_handle(ino);
+                        self.open_handles.insert(
+                            fh,
+                            HandleState::ReadVirtual {
+                                ino,
+                                bytes: Bytes::from(content.clone()),
+                            },
+                        );
+                        debug!(fh, path, ino, "Opened virtual warning note for direct lock-free reading");
+                        return Ok(fh);
                     }
                     StorageLocation::VirtualDirectory => {
                         return Err(VfsError::InternalFault("Cannot open directory as file".to_string()));
@@ -473,43 +945,25 @@ impl UcloudFsDriver {
 
             let cached_source = Arc::new(CachedByteSource::new(
                 ino,
+                node.size,
                 byte_source,
                 Arc::clone(&self.shared_block_cache),
-                Some(self.rt_handle.clone()),
+                Arc::clone(&self.hot_header_cache),
+                self.rt_handle.clone(),
             ));
 
-            let mut read_handle = EphemeralReadHandle::with_capacities(
-                self.allocate_fh(),
-                cached_source,
-                &self.valve,
-                32 * 1024 * 1024, // 32 MB forward window for continuous stutter-free video streaming
-                512 * 1024,       // 512 KB tail window
-            )?;
-            read_handle.enable_prefetch(true);
-            read_handle.enable_progressive(true); // Sub-second progressive video streaming
-            read_handle.set_runtime_handle(self.rt_handle.clone());
-
-            // Seed initial header slice if available in Hot Header Cache
-            if let Some(entry) = self.hot_header_cache.get(&ino)
-                && entry.timestamp.elapsed() < Duration::from_secs(30)
-                && let Some(head) = &entry.head
-            {
-                read_handle.seed_initial_header(0, head.clone());
-            }
-
-            let fh = read_handle.fh();
-
+            let fh = self.allocate_fh();
             let _ = self.sync_engine.register_open_handle(ino);
 
             self.open_handles.insert(
                 fh,
-                Arc::new(Mutex::new(HandleState::Read {
+                HandleState::ReadShared {
                     ino,
-                    handle: Box::new(read_handle),
-                })),
+                    source: cached_source,
+                },
             );
 
-            debug!(fh, path, ino, "Opened file for reading");
+            debug!(fh, path, ino, "Opened file for lock-free shared cached reading");
             Ok(fh)
         })
     }
@@ -520,22 +974,55 @@ impl UcloudFsDriver {
             let (parent_ino, filename) = self.resolve_path_parent_and_name(path)?;
             let fh = self.allocate_fh();
 
+            let (preferred_account, overwriting_existing) =
+                if let Some(existing_ino) = self.routing_table.lookup(parent_ino, &filename) {
+                    if let Some(node) = self.routing_table.get_inode(existing_ino) {
+                        match &node.location {
+                            StorageLocation::SingleAccount {
+                                account_id,
+                                google_file_id,
+                            } => (
+                                Some(account_id.clone()),
+                                Some((existing_ino, account_id.clone(), google_file_id.clone())),
+                            ),
+                            StorageLocation::StripedManifest {
+                                manifest_account_id,
+                                manifest_google_file_id,
+                                ..
+                            } => (
+                                Some(manifest_account_id.clone()),
+                                Some((
+                                    existing_ino,
+                                    manifest_account_id.clone(),
+                                    manifest_google_file_id.clone(),
+                                )),
+                            ),
+                            _ => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    let pref = self.routing_table.get_preferred_account_for_folder(parent_ino);
+                    (pref, None)
+                };
+
             self.open_handles.insert(
                 fh,
-                Arc::new(Mutex::new(HandleState::WritePending(Box::new(
-                    WritePendingState {
-                        path: path.to_string(),
-                        parent_ino,
-                        filename,
-                        allocation_size: 0,
-                        write_spool: None,
-                        single_guard: None,
-                        striped_guard: None,
-                        striped_plan: None,
-                        uploaded_bytes: Vec::new(),
-                        delete_on_close: false,
-                    },
-                )))),
+                HandleState::WritePending(Arc::new(Mutex::new(WritePendingState {
+                    path: path.to_string(),
+                    parent_ino,
+                    filename,
+                    allocation_size: 0,
+                    write_spool: None,
+                    single_guard: None,
+                    striped_guard: None,
+                    striped_plan: None,
+                    uploaded_bytes: Vec::new(),
+                    delete_on_close: false,
+                    preferred_account,
+                    overwriting_existing,
+                }))),
             );
 
             debug!(fh, path, "Created pending write handle");
@@ -549,10 +1036,7 @@ impl UcloudFsDriver {
             let (parent_ino, dirname) = self.resolve_path_parent_and_name(path)?;
             let ino = self.routing_table.create_virtual_directory(parent_ino, &dirname)?;
             let fh = self.allocate_fh();
-            self.open_handles.insert(
-                fh,
-                Arc::new(Mutex::new(HandleState::Directory { ino })),
-            );
+            self.open_handles.insert(fh, HandleState::Directory { ino });
             self.notifier.notify_created(path);
             let parent_path = self.routing_table.get_path_for_inode(parent_ino).unwrap_or_else(|| "/".to_string());
             self.notifier.notify_updated(&parent_path);
@@ -658,20 +1142,25 @@ impl UcloudFsDriver {
     /// Sets the file size / allocation size. Intercepts allocation size to resolve placement target!
     pub fn set_file_size(&self, fh: u64, size: u64) -> Result<(), VfsError> {
         self.execute_vfs_async_op(None, || async move {
-            let handle_arc = self
+            let handle_state = self
                 .open_handles
                 .get(&fh)
-                .map(|g| Arc::clone(g.value()))
+                .map(|g| g.value().clone())
                 .ok_or_else(|| VfsError::NotFound("Invalid file handle".to_string()))?;
 
-            let mut state = handle_arc.lock().await;
-            if let HandleState::WritePending(wp) = &mut *state {
+            if let HandleState::WritePending(wp_mutex) = handle_state {
+                let mut wp = wp_mutex.lock().await;
                 wp.allocation_size = size;
 
                 if wp.write_spool.is_none() && wp.striped_plan.is_none() && size > 0 {
                     let decision = self
                         .placement_engine
-                        .resolve_placement(size, &wp.filename, &*self.prompter)
+                        .resolve_placement_with_affinity(
+                            size,
+                            &wp.filename,
+                            &*self.prompter,
+                            wp.preferred_account.as_deref(),
+                        )
                         .await?;
 
                     match decision {
@@ -716,81 +1205,38 @@ impl UcloudFsDriver {
         })
     }
 
-    /// Reads binary content from an open file handle, checking Hot Header Cache for instant deduplication.
+    /// Reads binary content from an open file handle directly and lock-free without Mutex contention.
     pub fn read(&self, fh: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         self.execute_vfs_async_op(None, || async move {
-            let handle_arc = self
+            let handle_state = self
                 .open_handles
                 .get(&fh)
-                .map(|g| Arc::clone(g.value()))
+                .map(|g| g.value().clone())
                 .ok_or_else(|| VfsError::NotFound("Invalid file handle".to_string()))?;
 
-            let mut state = handle_arc.lock().await;
-            if let HandleState::Read { ino, handle } = &mut *state {
-                let ino_val = *ino;
-                let req_len = buffer.len();
-
-                // 1. Check Hot Header Cache for head slice (<512 KB, 30s TTL)
-                if offset + req_len as u64 <= 512 * 1024
-                    && let Some(entry) = self.hot_header_cache.get(&ino_val)
-                    && entry.timestamp.elapsed() < Duration::from_secs(30)
-                    && let Some(head) = &entry.head
-                {
+            match handle_state {
+                HandleState::ReadShared { ino: _, source } => {
+                    let bytes = source.fetch_range(offset, buffer.len()).await?;
+                    let len = bytes.len().min(buffer.len());
+                    buffer[..len].copy_from_slice(&bytes[..len]);
+                    Ok(len)
+                }
+                HandleState::ReadVirtual { ino: _, bytes } => {
                     let off = offset as usize;
-                    if off + req_len <= head.len() {
-                        buffer[..req_len].copy_from_slice(&head[off..off + req_len]);
-                        handle.seed_initial_header(0, head.clone());
-                        debug!(ino = ino_val, offset, req_len, "Hot Header Cache head hit (<0.001 ms)");
-                        return Ok(req_len);
+                    if off >= bytes.len() {
+                        return Ok(0);
                     }
+                    let avail = &bytes[off..];
+                    let len = avail.len().min(buffer.len());
+                    buffer[..len].copy_from_slice(&avail[..len]);
+                    Ok(len)
                 }
-
-                // 2. Check Hot Header Cache for tail slice
-                if let Some(entry) = self.hot_header_cache.get(&ino_val)
-                    && entry.timestamp.elapsed() < Duration::from_secs(30)
-                    && let Some((tail_start, tail_bytes)) = &entry.tail
-                {
-                    let t_start = *tail_start;
-                    let t_end = t_start + tail_bytes.len() as u64;
-                    if offset >= t_start && offset + req_len as u64 <= t_end {
-                        let off = (offset - t_start) as usize;
-                        buffer[..req_len].copy_from_slice(&tail_bytes[off..off + req_len]);
-                        debug!(ino = ino_val, offset, req_len, "Hot Header Cache tail hit (<0.001 ms)");
-                        return Ok(req_len);
-                    }
+                HandleState::WritePending(_) => {
+                    Err(VfsError::InternalFault("Handle not open for reading".to_string()))
                 }
-
-                // 3. Read from EphemeralReadHandle
-                let bytes = handle.read(offset, buffer.len()).await?;
-                let len = bytes.len().min(buffer.len());
-                buffer[..len].copy_from_slice(&bytes[..len]);
-
-                // 4. Populate Hot Header Cache for head (if reading from offset 0)
-                if offset == 0 && !bytes.is_empty() {
-                    let head_bytes = handle.peek_front_buffer(512 * 1024).unwrap_or_else(|| bytes.clone());
-                    let mut entry = self.hot_header_cache.entry(ino_val).or_insert_with(|| HotHeaderCacheEntry {
-                        head: None,
-                        tail: None,
-                        timestamp: std::time::Instant::now(),
-                    });
-                    entry.head = Some(head_bytes);
-                    entry.timestamp = std::time::Instant::now();
+                HandleState::Directory { .. } => {
+                    Err(VfsError::InternalFault("Cannot read directory handle".to_string()))
                 }
-
-                // 5. Populate Hot Header Cache for tail (if available)
-                if let Some((tail_start, tail_bytes)) = handle.peek_tail_buffer() {
-                    let mut entry = self.hot_header_cache.entry(ino_val).or_insert_with(|| HotHeaderCacheEntry {
-                        head: None,
-                        tail: None,
-                        timestamp: std::time::Instant::now(),
-                    });
-                    entry.tail = Some((tail_start, tail_bytes));
-                    entry.timestamp = std::time::Instant::now();
-                }
-
-                Ok(len)
-            } else {
-                Err(VfsError::InternalFault("Handle not open for reading".to_string()))
             }
         })
     }
@@ -798,14 +1244,14 @@ impl UcloudFsDriver {
     /// Writes binary content to an open file handle.
     pub fn write(&self, fh: u64, offset: u64, buffer: &[u8]) -> Result<usize, VfsError> {
         self.execute_vfs_async_op(None, || async move {
-            let handle_arc = self
+            let handle_state = self
                 .open_handles
                 .get(&fh)
-                .map(|g| Arc::clone(g.value()))
+                .map(|g| g.value().clone())
                 .ok_or_else(|| VfsError::NotFound("Invalid file handle".to_string()))?;
 
-            let mut state = handle_arc.lock().await;
-            if let HandleState::WritePending(wp) = &mut *state {
+            if let HandleState::WritePending(wp_mutex) = handle_state {
+                let mut wp = wp_mutex.lock().await;
                 if let Some(spool) = &mut wp.write_spool {
                     spool.write(offset, buffer).await
                 } else {
@@ -1039,13 +1485,13 @@ impl UcloudFsDriver {
     /// Finalizes open write streams on close, committing files to routing table and zeroizing RAM.
     pub fn cleanup(&self, fh: u64) -> Result<(), VfsError> {
         self.execute_vfs_async_op(None, || async move {
-            let handle_arc = match self.open_handles.get(&fh) {
-                Some(g) => Arc::clone(g.value()),
+            let handle_state = match self.open_handles.get(&fh) {
+                Some(g) => g.value().clone(),
                 None => return Ok(()),
             };
 
-            let mut state = handle_arc.lock().await;
-            if let HandleState::WritePending(wp) = &mut *state {
+            if let HandleState::WritePending(wp_mutex) = handle_state {
+                let mut wp = wp_mutex.lock().await;
                 if wp.delete_on_close {
                     debug!(fh, path = %wp.path, "Cancelled write handle with delete_on_close");
                     return Ok(());
@@ -1057,7 +1503,12 @@ impl UcloudFsDriver {
                     let total_bytes = wp.uploaded_bytes.len() as u64;
                     let decision = self
                         .placement_engine
-                        .resolve_placement(total_bytes.max(1), &wp.filename, &*self.prompter)
+                        .resolve_placement_with_affinity(
+                            total_bytes.max(1),
+                            &wp.filename,
+                            &*self.prompter,
+                            wp.preferred_account.as_deref(),
+                        )
                         .await?;
 
                     match decision {
@@ -1109,6 +1560,23 @@ impl UcloudFsDriver {
                         guard.commit();
                     }
 
+                    // If this write overwrote an existing file on the same account, remove the old file entry
+                    // first so insert_file doesn't trigger a false collision, and delete old file on Google Drive in background
+                    if let Some((_old_ino, old_account_id, old_google_file_id)) = wp.overwriting_existing.take() {
+                        let _ = self.routing_table.remove(wp.parent_ino, &wp.filename);
+                        let client_clone = Arc::clone(&self.client);
+                        let token_clone = self
+                            .account_tokens
+                            .get(&old_account_id)
+                            .map(|t| t.clone())
+                            .unwrap_or_default();
+                        tokio::spawn(async move {
+                            let _ = client_clone
+                                .delete_file(&old_account_id, &token_clone, &old_google_file_id)
+                                .await;
+                        });
+                    }
+
                     let location = StorageLocation::SingleAccount {
                         account_id: account_id.clone(),
                         google_file_id: commit_res.file_id.clone(),
@@ -1129,6 +1597,20 @@ impl UcloudFsDriver {
                     self.notifier.notify_created(&wp.path);
                     info!(path = %wp.path, total_bytes = commit_res.total_bytes, "Committed single file upload to VFS");
                 } else if let Some(guard) = wp.striped_guard.take() {
+                    if let Some((_old_ino, old_account_id, old_google_file_id)) = wp.overwriting_existing.take() {
+                        let _ = self.routing_table.remove(wp.parent_ino, &wp.filename);
+                        let client_clone = Arc::clone(&self.client);
+                        let token_clone = self
+                            .account_tokens
+                            .get(&old_account_id)
+                            .map(|t| t.clone())
+                            .unwrap_or_default();
+                        tokio::spawn(async move {
+                            let _ = client_clone
+                                .delete_file(&old_account_id, &token_clone, &old_google_file_id)
+                                .await;
+                        });
+                    }
                     let mut account_tokens = HashMap::new();
                     for item in self.account_tokens.iter() {
                         account_tokens.insert(item.key().clone(), item.value().clone());
@@ -1171,11 +1653,9 @@ impl UcloudFsDriver {
     /// Closes an open file handle and releases all associated memory.
     pub fn close(&self, fh: u64) -> Result<(), VfsError> {
         self.execute_vfs_op(None, || {
-            if let Some((_, handle_arc)) = self.open_handles.remove(&fh) {
-                if let Ok(state) = handle_arc.try_lock()
-                    && let HandleState::Read { ino, .. } = &*state
-                {
-                    self.sync_engine.unregister_open_handle(*ino);
+            if let Some((_, handle_state)) = self.open_handles.remove(&fh) {
+                if let HandleState::ReadShared { ino, .. } | HandleState::ReadVirtual { ino, .. } = handle_state {
+                    self.sync_engine.unregister_open_handle(ino);
                 }
                 debug!(fh, "Closed and unregistered file handle");
             }
@@ -1204,5 +1684,22 @@ impl UcloudFsDriver {
     #[must_use]
     pub fn active_handles_count(&self) -> usize {
         self.open_handles.len()
+    }
+
+    /// Debug helper to inspect open handles.
+    #[must_use]
+    pub fn open_handles_debug(&self) -> Vec<(u64, String)> {
+        self.open_handles
+            .iter()
+            .map(|entry| {
+                let state_str = match entry.value() {
+                    HandleState::ReadShared { ino, .. } => format!("ReadShared(ino: {ino})"),
+                    HandleState::ReadVirtual { ino, .. } => format!("ReadVirtual(ino: {ino})"),
+                    HandleState::WritePending(_) => "WritePending".to_string(),
+                    HandleState::Directory { ino } => format!("Directory(ino: {ino})"),
+                };
+                (*entry.key(), state_str)
+            })
+            .collect()
     }
 }

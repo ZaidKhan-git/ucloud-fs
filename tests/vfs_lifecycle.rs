@@ -10,6 +10,7 @@ use ucloud_fs::network::client::{
     BackoffConfig, GoogleChangeItem, GoogleChangesList, GoogleDriveClient,
 };
 use ucloud_fs::network::limiter::MultiTierLimiter;
+use ucloud_fs::routing::inode::{NewFileParams, StorageLocation};
 use ucloud_fs::routing::placement::PlacementEngine;
 use ucloud_fs::routing::sync::DeltaSyncEngine;
 use ucloud_fs::routing::InMemoryRoutingTable;
@@ -314,6 +315,7 @@ async fn test_vfs_full_lifecycle_stress() {
         prompter: Arc::clone(&prompter) as Arc<dyn ucloud_fs::vfs::prompt::ChunkPrompter>,
         valve: Arc::clone(&valve),
         rt_handle: tokio::runtime::Handle::current(),
+        volume_label: Some("ucloud-fs".to_string()),
     };
 
     let driver = Arc::new(UcloudFsDriver::new(deps));
@@ -628,4 +630,213 @@ async fn test_vfs_full_lifecycle_stress() {
     );
 
     println!("Stage 8 Full Lifecycle VFS Integration Stress Test PASSED with ZERO flaws!");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_overlapped_reads_zero_mutex_contention() {
+    let server = MockServer::start().await;
+    let storage = Arc::new(MockCloudStorage::new());
+    setup_mock_server(&server, Arc::clone(&storage)).await;
+
+    let limiter = Arc::new(MultiTierLimiter::with_config(
+        100_000,
+        200_000,
+        24,
+        std::time::Duration::from_secs(25),
+    ));
+    let client = Arc::new(
+        GoogleDriveClient::with_endpoints(
+            limiter,
+            server.uri(),
+            server.uri(),
+            BackoffConfig {
+                base_ms: 1,
+                max_backoff_ms: 5,
+                max_attempts: 1,
+            },
+        )
+        .expect("Build GoogleDriveClient"),
+    );
+
+    let routing_table = Arc::new(InMemoryRoutingTable::new());
+    let placement = Arc::new(PlacementEngine::new());
+    placement.register_account("acc_1", 100 * 1024 * 1024, 20 * 1024 * 1024);
+
+    let session = Arc::new(SessionController::new());
+    let notifier = Arc::new(MockShellNotifier::new());
+    let prompter = Arc::new(AutoAcceptPrompter);
+    let valve = Arc::new(MemoryBackpressureValve::new());
+
+    let sync_engine = Arc::new(DeltaSyncEngine::new(
+        Arc::clone(&client),
+        Arc::clone(&routing_table),
+        Arc::clone(&placement),
+        Arc::clone(&session),
+        Arc::clone(&notifier) as Arc<dyn ucloud_fs::vfs::notify::ShellNotifier>,
+    ));
+
+    let deps = DriverDependencies {
+        routing_table: Arc::clone(&routing_table),
+        placement_engine: Arc::clone(&placement),
+        session: Arc::clone(&session),
+        client: Arc::clone(&client),
+        sync_engine: Arc::clone(&sync_engine),
+        notifier: Arc::clone(&notifier) as Arc<dyn ucloud_fs::vfs::notify::ShellNotifier>,
+        prompter: Arc::clone(&prompter) as Arc<dyn ucloud_fs::vfs::prompt::ChunkPrompter>,
+        valve: Arc::clone(&valve),
+        rt_handle: tokio::runtime::Handle::current(),
+        volume_label: Some("ucloud-fs".to_string()),
+    };
+
+    let driver = Arc::new(UcloudFsDriver::new(deps));
+    driver.set_account_token("acc_1", "tok_acc_1");
+
+    // 1. Seed a 20 MB mock media file into mock storage and routing table
+    let video_size: usize = 20 * 1024 * 1024;
+    let mut video_bytes = Vec::with_capacity(video_size);
+    for i in 0..video_size {
+        video_bytes.push((i % 251) as u8);
+    }
+
+    let file_id = "mock_video_cloud_id";
+    {
+        let mut files = storage.files.lock().unwrap();
+        files.insert(file_id.to_string(), video_bytes.clone());
+    }
+
+    let video_ino = routing_table
+        .insert_file(NewFileParams {
+            parent_ino: InMemoryRoutingTable::ROOT_INO,
+            name: "VID_20240528_174528.mp4",
+            size: video_size as u64,
+            mime_type: "video/mp4",
+            modified_time: 1000,
+            created_time: 1000,
+            location: StorageLocation::SingleAccount {
+                account_id: "acc_1".to_string(),
+                google_file_id: file_id.to_string(),
+            },
+            web_view_link: None,
+        })
+        .expect("insert video file");
+
+    // 2. Open video file - returns a single file handle `fh`
+    let fh = driver.open("/VID_20240528_174528.mp4").expect("open video");
+
+    // 3. Issue 4 concurrent overlapped reads on the EXACT SAME file handle `fh`
+    // (simulating Windows Media Player: 2 video frame reads, 2 audio packet reads)
+    let d1 = Arc::clone(&driver);
+    let d2 = Arc::clone(&driver);
+    let d3 = Arc::clone(&driver);
+    let d4 = Arc::clone(&driver);
+
+    let t1 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let bytes_read = d1.read(fh, 0, &mut buf).expect("read t1");
+        assert_eq!(bytes_read, 64 * 1024);
+        buf
+    });
+
+    let t2 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let bytes_read = d2.read(fh, 64 * 1024, &mut buf).expect("read t2");
+        assert_eq!(bytes_read, 64 * 1024);
+        buf
+    });
+
+    let t3 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let bytes_read = d3.read(fh, 128 * 1024, &mut buf).expect("read t3");
+        assert_eq!(bytes_read, 64 * 1024);
+        buf
+    });
+
+    let t4 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let bytes_read = d4.read(fh, 192 * 1024, &mut buf).expect("read t4");
+        assert_eq!(bytes_read, 64 * 1024);
+        buf
+    });
+
+    let (res1, res2, res3, res4) = tokio::try_join!(t1, t2, t3, t4).expect("concurrent reads succeed");
+
+    // 4. Verify 100% byte fidelity without mutex corruption or shift
+    assert_eq!(&res1[..], &video_bytes[0..64 * 1024]);
+    assert_eq!(&res2[..], &video_bytes[64 * 1024..128 * 1024]);
+    assert_eq!(&res3[..], &video_bytes[128 * 1024..192 * 1024]);
+    assert_eq!(&res4[..], &video_bytes[192 * 1024..256 * 1024]);
+
+    // 5. Give background prefetcher a moment to run paced read-ahead
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // 6. Verify that paced read-ahead has pre-populated blocks up to 8 MB ahead in RAM
+    let blocks_populated = (1..=8)
+        .filter(|&b| driver.shared_block_cache.contains(video_ino, b))
+        .count();
+    assert!(
+        blocks_populated >= 2,
+        "Paced read-ahead pipeline must pre-populate blocks ahead in RAM (found {blocks_populated})"
+    );
+
+    driver.close(fh).expect("close video file handle");
+}
+
+#[tokio::test]
+async fn test_configurable_and_dynamic_volume_label() {
+    let routing_table = Arc::new(InMemoryRoutingTable::new());
+    let placement = Arc::new(PlacementEngine::new());
+    let session = Arc::new(SessionController::new());
+    let limiter = Arc::new(MultiTierLimiter::new());
+    let client = Arc::new(GoogleDriveClient::new(limiter).unwrap());
+    let notifier = Arc::new(MockShellNotifier::new());
+    let sync_engine = Arc::new(DeltaSyncEngine::new(
+        Arc::clone(&client),
+        Arc::clone(&routing_table),
+        Arc::clone(&placement),
+        Arc::clone(&session),
+        Arc::clone(&notifier) as Arc<dyn ucloud_fs::vfs::notify::ShellNotifier>,
+    ));
+    let prompter = Arc::new(AutoAcceptPrompter);
+    let valve = Arc::new(MemoryBackpressureValve::new());
+
+    // 1. Mount with custom volume label "MyCloud"
+    let deps = DriverDependencies {
+        routing_table: Arc::clone(&routing_table),
+        placement_engine: Arc::clone(&placement),
+        session: Arc::clone(&session),
+        client: Arc::clone(&client),
+        sync_engine: Arc::clone(&sync_engine),
+        notifier: Arc::clone(&notifier) as Arc<dyn ucloud_fs::vfs::notify::ShellNotifier>,
+        prompter: Arc::clone(&prompter) as Arc<dyn ucloud_fs::vfs::prompt::ChunkPrompter>,
+        valve: Arc::clone(&valve),
+        rt_handle: tokio::runtime::Handle::current(),
+        volume_label: Some("MyCloud".to_string()),
+    };
+
+    let driver = Arc::new(UcloudFsDriver::new(deps));
+    assert_eq!(driver.get_volume_label(), "MyCloud");
+    let info = driver.get_volume_info().expect("get_volume_info");
+    assert_eq!(info.volume_label, "MyCloud");
+
+    // 2. Dynamically rename volume to "WorkDrive" (simulating Windows Explorer SetVolumeLabel)
+    driver.set_volume_label("WorkDrive");
+    assert_eq!(driver.get_volume_label(), "WorkDrive");
+    let updated_info = driver.get_volume_info().expect("get_volume_info updated");
+    assert_eq!(updated_info.volume_label, "WorkDrive");
+
+    // 3. Test default when volume_label is None
+    let deps_default = DriverDependencies {
+        routing_table: Arc::clone(&routing_table),
+        placement_engine: Arc::clone(&placement),
+        session: Arc::clone(&session),
+        client: Arc::clone(&client),
+        sync_engine: Arc::clone(&sync_engine),
+        notifier: Arc::clone(&notifier) as Arc<dyn ucloud_fs::vfs::notify::ShellNotifier>,
+        prompter: Arc::clone(&prompter) as Arc<dyn ucloud_fs::vfs::prompt::ChunkPrompter>,
+        valve: Arc::clone(&valve),
+        rt_handle: tokio::runtime::Handle::current(),
+        volume_label: None,
+    };
+    let driver_default = Arc::new(UcloudFsDriver::new(deps_default));
+    assert_eq!(driver_default.get_volume_label(), "ucloud");
 }

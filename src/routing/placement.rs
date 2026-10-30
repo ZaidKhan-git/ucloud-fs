@@ -262,6 +262,18 @@ impl PlacementEngine {
         filename: &str,
         prompter: &P,
     ) -> Result<PlacementDecision, VfsError> {
+        self.resolve_placement_with_affinity(size, filename, prompter, None)
+            .await
+    }
+
+    /// Resolves file placement across the three tiers with optional parent directory account affinity.
+    pub async fn resolve_placement_with_affinity<P: ChunkPrompter + ?Sized>(
+        &self,
+        size: u64,
+        filename: &str,
+        prompter: &P,
+        preferred_account: Option<&str>,
+    ) -> Result<PlacementDecision, VfsError> {
         // Collect snapshots of accounts and sort by effective free space descending
         let mut candidates: Vec<Arc<AccountQuota>> = self
             .accounts
@@ -281,7 +293,26 @@ impl PlacementEngine {
             .unwrap_or(0);
         let total_pool_free: u64 = candidates.iter().map(|a| a.effective_free_bytes()).sum();
 
-        // Tier 1: Fits single account with safety margin
+        // Tier 1a: Check preferred account affinity first (folder account affinity / file overwrite)
+        if let Some(pref_id) = preferred_account
+            && let Some(acc) = self.accounts.get(pref_id)
+            && acc.try_reserve(size, self.safety_margin)
+        {
+            info!(
+                account = %acc.account_id,
+                size,
+                filename,
+                "Tier 1 (Affinity): Routed file to preferred Google account"
+            );
+            return Ok(PlacementDecision::SingleAccount(SingleReservationGuard::new(
+                acc.account_id.clone(),
+                size,
+                Arc::clone(&acc.reserved_in_flight_bytes),
+                Some(Arc::clone(&acc.used_bytes)),
+            )));
+        }
+
+        // Tier 1b: Fits single account with safety margin
         for acc in &candidates {
             if acc.try_reserve(size, self.safety_margin) {
                 info!(
@@ -540,5 +571,53 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, VfsError::DiskFull);
+    }
+
+    #[tokio::test]
+    async fn test_parent_folder_account_affinity() {
+        let engine = PlacementEngine::with_safety_margin(16 * 1024 * 1024);
+        let gb = 1024 * 1024 * 1024;
+
+        // Account A: 10 GB free
+        engine.register_account("acc_a", 15 * gb, 5 * gb);
+        // Account B: 30 GB free (3x more than Account A!)
+        engine.register_account("acc_b", 50 * gb, 20 * gb);
+
+        let prompter = AutoRejectPrompter;
+
+        // Upload into folder owned by Account A:
+        // Even though Account B has 30 GB free and Account A only has 10 GB free,
+        // it MUST reserve quota on Account A because of parent affinity!
+        let decision = engine
+            .resolve_placement_with_affinity(2 * gb, "file_in_a.pdf", &prompter, Some("acc_a"))
+            .await
+            .unwrap();
+
+        match decision {
+            PlacementDecision::SingleAccount(guard) => {
+                assert_eq!(guard.account_id, "acc_a", "Must place on preferred Account A");
+                assert_eq!(guard.reserved_bytes, 2 * gb);
+            }
+            PlacementDecision::StripedManifest(_) => panic!("Expected single account placement"),
+        }
+
+        // Now test fallback when preferred account has insufficient space:
+        // Account A has 10 GB free. Upload 12 GB file with preferred_account = Some("acc_a").
+        // Since Account A cannot hold 12 GB, it falls back to Account B (30 GB free)!
+        let decision_fallback = engine
+            .resolve_placement_with_affinity(12 * gb, "big_in_a.zip", &prompter, Some("acc_a"))
+            .await
+            .unwrap();
+
+        match decision_fallback {
+            PlacementDecision::SingleAccount(guard) => {
+                assert_eq!(
+                    guard.account_id, "acc_b",
+                    "Must fallback to Account B when Account A is full"
+                );
+                assert_eq!(guard.reserved_bytes, 12 * gb);
+            }
+            PlacementDecision::StripedManifest(_) => panic!("Expected single account placement"),
+        }
     }
 }

@@ -496,10 +496,48 @@ unsafe extern "system" fn get_volume_info_cb(
 
 unsafe extern "system" fn set_volume_label_cb(
     fs: *mut FspFileSystem,
-    _volume_label: *const u16,
+    volume_label: *const u16,
     volume_info: *mut FspFsctlVolumeInfo,
 ) -> i32 {
-    unsafe { get_volume_info_cb(fs, volume_info) }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        if fs.is_null() || (*fs).user_context.is_null() || volume_info.is_null() {
+            return STATUS_UNSUCCESSFUL;
+        }
+        let mount_ctx = &*((*fs).user_context as *const MountContext);
+
+        if !volume_label.is_null()
+            && let Some(label_str) = pwstr_to_string(volume_label)
+        {
+            mount_ctx.driver.set_volume_label(&label_str);
+        }
+
+        let info = match mount_ctx.driver.get_volume_info() {
+            Ok(v) => v,
+            Err(e) => return vfs_error_to_ntstatus(&e),
+        };
+
+        (*volume_info).total_size = info.total_bytes;
+        (*volume_info).free_size = info.free_bytes;
+
+        let label: Vec<u16> = info.volume_label.encode_utf16().collect();
+        let copy_len = label.len().min(31);
+        (*volume_info).volume_label_length = (copy_len * 2) as u16;
+        std::ptr::copy_nonoverlapping(
+            label.as_ptr(),
+            std::ptr::addr_of_mut!((*volume_info).volume_label) as *mut u16,
+            copy_len,
+        );
+        let terminator =
+            (std::ptr::addr_of_mut!((*volume_info).volume_label) as *mut u16).add(copy_len);
+        *terminator = 0;
+
+        STATUS_SUCCESS
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => STATUS_UNSUCCESSFUL,
+    }
 }
 
 unsafe extern "system" fn get_security_by_name_cb(
@@ -1278,7 +1316,7 @@ impl Default for WinFspMountOptions {
     fn default() -> Self {
         Self {
             mount_point: "Y:".to_string(),
-            volume_label: "ucloud-fs".to_string(),
+            volume_label: "ucloud".to_string(),
             case_sensitive_search: false,
             case_preserved_names: true,
             unicode_on_disk: true,

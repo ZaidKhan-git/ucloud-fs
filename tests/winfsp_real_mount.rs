@@ -305,6 +305,7 @@ async fn test_winfsp_real_kernel_mount() {
         prompter: Arc::clone(&prompter) as Arc<dyn ucloud_fs::vfs::prompt::ChunkPrompter>,
         valve: Arc::clone(&valve),
         rt_handle: tokio::runtime::Handle::current(),
+        volume_label: None,
     };
 
     let driver = Arc::new(UcloudFsDriver::new(deps));

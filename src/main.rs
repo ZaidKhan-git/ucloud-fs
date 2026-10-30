@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subcommand = args.get(1).map(String::as_str).unwrap_or("help");
 
     match subcommand {
-        "login" => {
+        "login" | "add-account" => {
             let mut custom_id = None;
             let mut custom_secret = None;
             let mut i = 2;
@@ -96,12 +96,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_test_live().await?;
         }
         "mount" => {
-            let drive_letter = args
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or("X:")
-                .to_string();
-            cmd_mount(drive_letter).await?;
+            let mut drive_letter = "X:".to_string();
+            let mut volume_label = "ucloud".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if (args[i] == "--label" || args[i] == "--volume-label") && i + 1 < args.len() {
+                    volume_label = args[i + 1].clone();
+                    i += 2;
+                } else if !args[i].starts_with('-') && i == 2 {
+                    drive_letter = args[i].clone();
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_mount(drive_letter, volume_label).await?;
         }
         _ => {
             print_usage();
@@ -121,10 +130,13 @@ fn print_usage() {
     );
     println!("Usage: ucloud-fs <COMMAND> [OPTIONS]\n");
     println!("Commands:");
-    println!("  login         Link a real Google Drive account via OAuth 2.0 PKCE loopback");
+    println!("  add-account   Link an additional Google Drive account (alias: login)");
+    println!("                Options: [--client-id <ID>] [--client-secret <SECRET>]");
+    println!("  login         Link a Google Drive account via OAuth 2.0 PKCE loopback");
     println!("  status        Display encrypted vault status and live storage quota");
     println!("  test-live     Execute real-world live test suite against linked account");
     println!("  mount [DRIVE] Mount the unified virtual filesystem (default: X:)");
+    println!("                Options: [--label <NAME>] [--volume-label <NAME>] (default: ucloud)");
     println!("  help          Show this help message\n");
 }
 
@@ -164,22 +176,47 @@ async fn cmd_login(
         "================================================================================\n"
     );
 
-    let client_id = custom_id
+    let client_id = match custom_id
         .or_else(|| std::env::var("UCLOUD_CLIENT_ID").ok())
         .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
-        .ok_or_else(|| {
-            VfsError::PermissionDenied(
-                "No Google Client ID provided. Provide --client-id <ID> or set UCLOUD_CLIENT_ID / GOOGLE_CLIENT_ID environment variable.".to_string(),
-            )
-        })?;
-    let client_secret = custom_secret
+    {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            use std::io::Write;
+            print!("Enter Google OAuth Client ID: ");
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(Box::new(VfsError::PermissionDenied(
+                    "No Google Client ID provided. Pass --client-id <ID> or set UCLOUD_CLIENT_ID.".to_string(),
+                )));
+            }
+            trimmed
+        }
+    };
+
+    let client_secret = match custom_secret
         .or_else(|| std::env::var("UCLOUD_CLIENT_SECRET").ok())
         .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
-        .ok_or_else(|| {
-            VfsError::PermissionDenied(
-                "No Google Client Secret provided. Provide --client-secret <SECRET> or set UCLOUD_CLIENT_SECRET / GOOGLE_CLIENT_SECRET environment variable.".to_string(),
-            )
-        })?;
+    {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            use std::io::Write;
+            print!("Enter Google OAuth Client Secret: ");
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(Box::new(VfsError::PermissionDenied(
+                    "No Google Client Secret provided. Pass --client-secret <SECRET> or set UCLOUD_CLIENT_SECRET.".to_string(),
+                )));
+            }
+            trimmed
+        }
+    };
 
     // Bind loopback on 127.0.0.1:8080 (fallback to 127.0.0.1:0)
     let listener = match TcpListener::bind("127.0.0.1:8080").await {
@@ -332,6 +369,8 @@ async fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
         .as_secs();
 
     let mut updated_creds = creds.clone();
+    let mut total_pool_limit = 0u64;
+    let mut total_pool_used = 0u64;
 
     for (idx, cred) in creds.iter().enumerate() {
         let (cid, csecret) = match resolve_client_credentials(cred) {
@@ -373,6 +412,9 @@ async fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
                     (0, 0)
                 };
 
+                total_pool_limit = total_pool_limit.saturating_add(limit);
+                total_pool_used = total_pool_used.saturating_add(used);
+
                 let limit_gb = (limit as f64) / (1024.0 * 1024.0 * 1024.0);
                 let used_gb = (used as f64) / (1024.0 * 1024.0 * 1024.0);
                 println!(
@@ -391,7 +433,16 @@ async fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let _ = save_vault_credentials(&updated_creds).await;
-    println!();
+
+    let total_limit_gb = (total_pool_limit as f64) / (1024.0 * 1024.0 * 1024.0);
+    let total_used_gb = (total_pool_used as f64) / (1024.0 * 1024.0 * 1024.0);
+    let total_free_gb = (total_limit_gb - total_used_gb).max(0.0);
+    println!("--------------------------------------------------------------------------------");
+    println!("  Aggregated Storage Pool Summary (Across All {} Accounts):", creds.len());
+    println!("    Total Pool Capacity: {:.2} GB", total_limit_gb);
+    println!("    Total Pool Used:     {:.2} GB", total_used_gb);
+    println!("    Total Pool Free:     {:.2} GB", total_free_gb);
+    println!("================================================================================\n");
     Ok(())
 }
 
@@ -576,7 +627,7 @@ async fn cmd_test_live() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_mount(drive_letter: String, volume_label: String) -> Result<(), Box<dyn std::error::Error>> {
     // Acquire system-wide singleton mutex to prevent dual-process collision
     let mutex_name: Vec<u16> = "Global\\ucloud_fs_daemon_singleton_lock\0".encode_utf16().collect();
     let mutex_handle = unsafe {
@@ -600,7 +651,7 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
     let mut creds = load_vault_credentials().await?;
     if creds.is_empty() {
         return Err(Box::new(VfsError::PermissionDenied(
-            "No authenticated accounts found in vault.enc. Please run 'ucloud-fs login' first.".to_string(),
+            "No authenticated accounts found in vault.enc. Please run 'ucloud-fs login' or 'ucloud-fs add-account' first.".to_string(),
         )));
     }
 
@@ -609,6 +660,7 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
     );
     println!("  ucloud-fs Virtual Filesystem Mounting");
     println!("  Target Drive Letter: {drive_letter}");
+    println!("  Volume Label:        {volume_label}");
     println!(
         "================================================================================\n"
     );
@@ -702,10 +754,11 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
         session: Arc::clone(&session),
         client: Arc::clone(&client),
         sync_engine: Arc::clone(&sync_engine),
-        notifier,
+        notifier: Arc::clone(&notifier),
         prompter,
         valve,
         rt_handle: tokio::runtime::Handle::current(),
+        volume_label: Some(volume_label.clone()),
     }));
 
     for cred in &creds {
@@ -714,7 +767,7 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
 
     let mount_options = WinFspMountOptions {
         mount_point: drive_letter.clone(),
-        volume_label: "ucloud-fs".to_string(),
+        volume_label: volume_label.clone(),
         case_sensitive_search: false,
         case_preserved_names: true,
         unicode_on_disk: true,
@@ -725,18 +778,74 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
     let mount_guard = WinFspMountGuard::mount(Arc::clone(&driver), mount_options)?;
 
     println!(
-        "\nDrive {drive_letter} is MOUNTED and ACTIVE. (Volume: ucloud-fs)"
+        "\nDrive {drive_letter} is MOUNTED and ACTIVE. (Volume: {volume_label})"
     );
     println!("Total routing table files indexed: {}", routing_table.count());
     println!("Press Ctrl+C to unmount and exit cleanly.\n");
 
-    // Background Delta Sync task (every 10 seconds for real-time cloud changes)
+    // Background Delta Sync & Dynamic Vault Hot-Reload task (every 10 seconds)
     let sync_engine_bg = Arc::clone(&sync_engine);
-    let bg_creds = creds.clone();
+    let routing_table_bg = Arc::clone(&routing_table);
+    let client_bg = Arc::clone(&client);
+    let driver_bg = Arc::clone(&driver);
+    let notifier_bg = Arc::clone(&notifier);
+    let mut bg_creds = creds.clone();
+    let mut known_accounts: std::collections::HashSet<String> =
+        bg_creds.iter().map(|c| c.account_id.clone()).collect();
+    let passphrase_shield = zeroize::Zeroizing::new(get_master_passphrase());
+    let mut last_vault_mtime = std::fs::metadata(VAULT_FILE).and_then(|m| m.modified()).ok();
+
     let sync_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
+
+            // 1. Check for vault.enc modifications (dynamic account addition via CLI)
+            if let Ok(metadata) = std::fs::metadata(VAULT_FILE)
+                && let Ok(mtime) = metadata.modified()
+                && (last_vault_mtime.is_none() || Some(mtime) > last_vault_mtime)
+            {
+                last_vault_mtime = Some(mtime);
+                    if let Ok(payload) = tokio::fs::read(VAULT_FILE).await
+                        && let Ok(fresh_creds) = decrypt_credentials(
+                            &payload,
+                            &passphrase_shield,
+                            KeyDerivationParams::default(),
+                        )
+                    {
+                        for cred in &fresh_creds {
+                            if !known_accounts.contains(&cred.account_id) {
+                                known_accounts.insert(cred.account_id.clone());
+                                bg_creds.push(cred.clone());
+                                if let Ok(data) = client_bg
+                                    .hydrate_account(&cred.account_id, &cred.access_token)
+                                    .await
+                                {
+                                    driver_bg.register_account(
+                                        &cred.account_id,
+                                        &cred.access_token,
+                                        data.storage_limit_bytes,
+                                        data.storage_used_bytes,
+                                    );
+                                    let _ = routing_table_bg.hydrate_account_data(&data);
+                                    notifier_bg.notify_updated("/");
+                                    info!(
+                                        account = %cred.account_id,
+                                        limit = data.storage_limit_bytes,
+                                        "Live Vault Hot-Reload: Dynamically added new account and updated storage pool"
+                                    );
+                                    println!(
+                                        "\n[HOT-RELOAD] Dynamically mounted new Google account: {} (+{:.2} GB pool storage)",
+                                        cred.account_id,
+                                        (data.storage_limit_bytes as f64) / (1024.0 * 1024.0 * 1024.0)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+            // 2. Poll delta sync across linked accounts
             for c in &bg_creds {
                 if let Err(e) = sync_engine_bg.poll_account(&c.account_id, &c.access_token).await {
                     warn!(account = %c.account_id, error = %e, "Background delta sync encountered error");
