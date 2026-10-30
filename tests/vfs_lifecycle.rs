@@ -226,6 +226,26 @@ async fn setup_mock_server(server: &MockServer, storage: Arc<MockCloudStorage>) 
         .respond_with(ResponseTemplate::new(204))
         .mount(server)
         .await;
+
+    // 5. Folder create (POST /drive/v3/files)
+    Mock::given(method("POST"))
+        .and(path("/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "mock_created_folder_id",
+            "name": "mock_folder",
+            "mimeType": "application/vnd.google-apps.folder"
+        })))
+        .mount(server)
+        .await;
+
+    // 6. File rename / move (PATCH /drive/v3/files/.*)
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "mock_patched_id",
+            "name": "mock_renamed"
+        })))
+        .mount(server)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

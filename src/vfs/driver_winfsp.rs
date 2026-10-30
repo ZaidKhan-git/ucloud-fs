@@ -142,6 +142,7 @@ pub struct FspFileSystemInterface {
     pub reserved: [Option<unsafe extern "system" fn() -> i32>; 31],
 }
 
+
 const _: () = assert!(std::mem::size_of::<FspFileSystemInterface>() == 512);
 
 /// Dynamic API dispatch table for `winfsp-x64.dll`.
@@ -347,7 +348,7 @@ impl WinFspFileContext {
     }
 }
 
-/// Converts UTF-16 null-terminated pointer into Rust String.
+/// Converts UTF-16 null-terminated pointer into Rust String, normalizing default data stream suffixes like `::$DATA`.
 unsafe fn pwstr_to_string(ptr: *const u16) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -357,7 +358,11 @@ unsafe fn pwstr_to_string(ptr: *const u16) -> Option<String> {
         len += 1;
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    String::from_utf16(slice).ok()
+    let mut s = String::from_utf16(slice).ok()?;
+    if s.ends_with("::$DATA") || s.ends_with("::$data") {
+        s.truncate(s.len() - 7);
+    }
+    Some(s)
 }
 
 /// Converts Unix epoch seconds to Windows FILETIME (100ns intervals since Jan 1, 1601 UTC).
@@ -371,6 +376,7 @@ fn vfs_error_to_ntstatus(err: &VfsError) -> i32 {
         VfsError::InternalFault(msg) if msg.contains("Directory not empty") => {
             STATUS_DIRECTORY_NOT_EMPTY
         }
+        VfsError::AlternateDataStreamIgnored(_) => STATUS_OBJECT_NAME_NOT_FOUND,
         _ => err.to_ntstatus(),
     }
 }
@@ -382,7 +388,16 @@ fn populate_fsp_file_info(fsp_info: *mut FspFsctlFileInfo, info: &FileInfo) {
     }
     // SAFETY: Writing file metadata fields to caller-supplied FspFsctlFileInfo pointer.
     unsafe {
-        (*fsp_info).file_attributes = info.file_attributes;
+        let attrs = if info.is_directory {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else if info.is_readonly {
+            FILE_ATTRIBUTE_NORMAL | crate::vfs::driver::FILE_ATTRIBUTE_READONLY
+        } else if info.file_attributes != 0 {
+            info.file_attributes
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        (*fsp_info).file_attributes = attrs;
         (*fsp_info).reparse_tag = 0;
         (*fsp_info).allocation_size = info.allocation_size;
         (*fsp_info).file_size = info.size;
@@ -410,7 +425,16 @@ fn populate_fsp_dir_info(dir_info: *mut FspFsctlDirInfo, info: &FileInfo, name: 
         std::ptr::write_bytes(dir_info as *mut u8, 0, 104);
 
         (*dir_info).size = dir_info_size as u16;
-        (*dir_info).file_info.file_attributes = info.file_attributes;
+        let attrs = if info.is_directory {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else if info.is_readonly {
+            FILE_ATTRIBUTE_NORMAL | crate::vfs::driver::FILE_ATTRIBUTE_READONLY
+        } else if info.file_attributes != 0 {
+            info.file_attributes
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        (*dir_info).file_info.file_attributes = attrs;
         (*dir_info).file_info.reparse_tag = 0;
         (*dir_info).file_info.allocation_size = info.allocation_size;
         (*dir_info).file_info.file_size = info.size;
@@ -1316,13 +1340,13 @@ impl WinFspMountGuard {
         }
 
         // 2. Generate default permissive Security Descriptor
-        // SDDL "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)"
+        // SDDL "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)(A;OICI;FA;;;AU)(A;OICI;FA;;;AC)"
         // grants FILE_ALL_ACCESS (FA: 0x1F01FF) including DELETE to SYSTEM, Built-in Administrators, and Everyone (WD),
         // with complete Owner (O:BA) and Group (G:BA) SIDs so Windows kernel validates the descriptor.
         let mut default_sd: *mut c_void = std::ptr::null_mut();
         let mut sd_size: u32 = 0;
         let mut sddl_wide: Vec<u16> =
-            "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)"
+            "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)(A;OICI;FA;;;AU)(A;OICI;FA;;;AC)"
                 .encode_utf16()
                 .collect();
         sddl_wide.push(0);

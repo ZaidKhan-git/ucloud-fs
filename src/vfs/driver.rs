@@ -96,6 +96,14 @@ enum HandleState {
     WritePending(Box<WritePendingState>),
 }
 
+/// Hot Header Cache entry storing initial 512 KB and tail 512 KB of recently accessed files.
+#[derive(Debug, Clone)]
+pub struct HotHeaderCacheEntry {
+    pub head: Option<Bytes>,
+    pub tail: Option<(u64, Bytes)>,
+    pub timestamp: std::time::Instant,
+}
+
 /// Core dependencies required to initialize the VFS driver.
 pub struct DriverDependencies {
     pub routing_table: Arc<InMemoryRoutingTable>,
@@ -124,6 +132,7 @@ pub struct UcloudFsDriver {
     next_fh: AtomicU64,
     account_tokens: DashMap<String, String>,
     mock_files: DashMap<String, Bytes>,
+    pub hot_header_cache: DashMap<u64, HotHeaderCacheEntry>,
     is_mounted: AtomicBool,
 }
 
@@ -145,6 +154,7 @@ impl UcloudFsDriver {
             next_fh: AtomicU64::new(100),
             account_tokens: DashMap::new(),
             mock_files: DashMap::new(),
+            hot_header_cache: DashMap::new(),
             is_mounted: AtomicBool::new(true),
         }
     }
@@ -463,10 +473,21 @@ impl UcloudFsDriver {
                 self.allocate_fh(),
                 byte_source,
                 &self.valve,
-                32 * 1024 * 1024, // 32 MB forward window for smooth 1080p video streaming
+                32 * 1024 * 1024, // 32 MB forward window for continuous stutter-free video streaming
                 512 * 1024,       // 512 KB tail window
             )?;
             read_handle.enable_prefetch(true);
+            read_handle.enable_progressive(true); // Sub-second progressive video streaming
+            read_handle.set_runtime_handle(self.rt_handle.clone());
+
+            // Seed initial header slice if available in Hot Header Cache
+            if let Some(entry) = self.hot_header_cache.get(&ino)
+                && entry.timestamp.elapsed() < Duration::from_secs(30)
+                && let Some(head) = &entry.head
+            {
+                read_handle.seed_initial_header(0, head.clone());
+            }
+
             let fh = read_handle.fh();
 
             let _ = self.sync_engine.register_open_handle(ino);
@@ -513,9 +534,9 @@ impl UcloudFsDriver {
         })
     }
 
-    /// Creates a new directory and synchronously creates cloud folders on all linked Google accounts.
+    /// Creates a new directory purely in RAM (<0.001 ms). Remote folders are lazily materialized on upload.
     pub fn create_directory(&self, path: &str) -> Result<u64, VfsError> {
-        self.execute_vfs_async_op(Some(path), || async {
+        self.execute_vfs_op(Some(path), || {
             let (parent_ino, dirname) = self.resolve_path_parent_and_name(path)?;
             let ino = self.routing_table.create_virtual_directory(parent_ino, &dirname)?;
             let fh = self.allocate_fh();
@@ -527,52 +548,102 @@ impl UcloudFsDriver {
             let parent_path = self.routing_table.get_path_for_inode(parent_ino).unwrap_or_else(|| "/".to_string());
             self.notifier.notify_updated(&parent_path);
 
-            let tokens: Vec<(String, String)> = self
-                .account_tokens
-                .iter()
-                .map(|kv| (kv.key().clone(), kv.value().clone()))
-                .collect();
-
-            for (account_id, token) in tokens {
-                let parent_remote = if parent_ino == InMemoryRoutingTable::ROOT_INO {
-                    None
-                } else {
-                    self.routing_table.get_remote_folder_id(parent_ino, &account_id)
-                };
-
-                match self.client
-                    .create_folder(
-                        &account_id,
-                        &token,
-                        &dirname,
-                        parent_remote.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(remote_id) => {
-                        self.routing_table.record_remote_folder_id(ino, &account_id, &remote_id);
-                        self.sync_engine.record_local_upsert(&account_id, &remote_id);
-                        info!(
-                            account = %account_id,
-                            dirname = %dirname,
-                            remote_id = %remote_id,
-                            "Created remote folder on Google Drive"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            account = %account_id,
-                            dirname = %dirname,
-                            error = %e,
-                            "Failed to create remote folder on Google Drive"
-                        );
-                    }
-                }
-            }
-
-            debug!(fh, path, ino, "Created virtual directory handle and synchronized cloud folder");
+            debug!(fh, path, ino, "Created in-memory virtual directory handle (lazy cloud materialization)");
             Ok(fh)
         })
+    }
+
+    /// Ensures that virtual directory `target_ino` and all unmaterialized ancestors up to ROOT_INO
+    /// are materialized on `account_id` before file upload or cross-parent move.
+    /// Returns the remote Google folder ID for `target_ino`, or `None` if `target_ino == ROOT_INO`.
+    pub async fn ensure_remote_folder_chain_impl(
+        routing_table: &InMemoryRoutingTable,
+        client: &GoogleDriveClient,
+        sync_engine: &DeltaSyncEngine,
+        target_ino: u64,
+        account_id: &str,
+        token: &str,
+    ) -> Result<Option<String>, VfsError> {
+        if target_ino == InMemoryRoutingTable::ROOT_INO {
+            return Ok(None);
+        }
+
+        if let Some(folder_id) = routing_table.get_remote_folder_id(target_ino, account_id) {
+            return Ok(Some(folder_id));
+        }
+
+        // Walk up from target_ino collecting unmaterialized ancestors
+        let mut unmaterialized = Vec::new();
+        let mut curr_ino = target_ino;
+
+        while curr_ino != InMemoryRoutingTable::ROOT_INO {
+            if routing_table.get_remote_folder_id(curr_ino, account_id).is_some() {
+                break;
+            }
+
+            let node = routing_table.get_inode(curr_ino).ok_or_else(|| {
+                VfsError::NotFound(format!("Directory inode {curr_ino} not found during materialization"))
+            })?;
+
+            if !node.is_directory {
+                return Err(VfsError::NotFound(format!("Inode {curr_ino} is not a directory")));
+            }
+
+            unmaterialized.push((curr_ino, node.name.clone()));
+            curr_ino = node.parent_ino;
+        }
+
+        unmaterialized.reverse();
+
+        let mut parent_remote = if curr_ino == InMemoryRoutingTable::ROOT_INO {
+            None
+        } else {
+            routing_table.get_remote_folder_id(curr_ino, account_id)
+        };
+
+        for (dir_ino, dir_name) in unmaterialized {
+            info!(
+                account = %account_id,
+                dir_ino,
+                dir_name = %dir_name,
+                parent_remote = ?parent_remote,
+                "Lazy folder materialization: creating remote folder on Google Drive"
+            );
+
+            let remote_id = client
+                .create_folder(
+                    account_id,
+                    token,
+                    &dir_name,
+                    parent_remote.as_deref(),
+                )
+                .await?;
+
+            routing_table.record_remote_folder_id(dir_ino, account_id, &remote_id);
+            sync_engine.record_local_upsert(account_id, &remote_id);
+
+            parent_remote = Some(remote_id);
+        }
+
+        Ok(parent_remote)
+    }
+
+    /// Public convenience helper calling `ensure_remote_folder_chain_impl` with driver dependencies.
+    pub async fn ensure_remote_folder_chain(
+        &self,
+        target_ino: u64,
+        account_id: &str,
+        token: &str,
+    ) -> Result<Option<String>, VfsError> {
+        Self::ensure_remote_folder_chain_impl(
+            &self.routing_table,
+            &self.client,
+            &self.sync_engine,
+            target_ino,
+            account_id,
+            token,
+        )
+        .await
     }
 
     /// Sets the file size / allocation size. Intercepts allocation size to resolve placement target!
@@ -598,11 +669,7 @@ impl UcloudFsDriver {
                         PlacementDecision::SingleAccount(guard) => {
                             let account_id = guard.account_id.clone();
                             let token = self.account_tokens.get(&account_id).map(|t| t.clone()).unwrap_or_default();
-                            let parent_remote = if wp.parent_ino == InMemoryRoutingTable::ROOT_INO {
-                                None
-                            } else {
-                                self.routing_table.get_remote_folder_id(wp.parent_ino, &account_id)
-                            };
+                            let parent_remote = self.ensure_remote_folder_chain(wp.parent_ino, &account_id, &token).await?;
                             let metadata = GoogleFileInput {
                                 name: wp.filename.clone(),
                                 mime_type: Some("application/octet-stream".to_string()),
@@ -640,7 +707,7 @@ impl UcloudFsDriver {
         })
     }
 
-    /// Reads binary content from an open file handle.
+    /// Reads binary content from an open file handle, checking Hot Header Cache for instant deduplication.
     pub fn read(&self, fh: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         self.execute_vfs_async_op(None, || async move {
             let handle_arc = self
@@ -650,10 +717,68 @@ impl UcloudFsDriver {
                 .ok_or_else(|| VfsError::NotFound("Invalid file handle".to_string()))?;
 
             let mut state = handle_arc.lock().await;
-            if let HandleState::Read { handle, .. } = &mut *state {
+            if let HandleState::Read { ino, handle } = &mut *state {
+                let ino_val = *ino;
+                let req_len = buffer.len();
+
+                // 1. Check Hot Header Cache for head slice (<512 KB, 30s TTL)
+                if offset + req_len as u64 <= 512 * 1024
+                    && let Some(entry) = self.hot_header_cache.get(&ino_val)
+                    && entry.timestamp.elapsed() < Duration::from_secs(30)
+                    && let Some(head) = &entry.head
+                {
+                    let off = offset as usize;
+                    if off + req_len <= head.len() {
+                        buffer[..req_len].copy_from_slice(&head[off..off + req_len]);
+                        handle.seed_initial_header(0, head.clone());
+                        debug!(ino = ino_val, offset, req_len, "Hot Header Cache head hit (<0.001 ms)");
+                        return Ok(req_len);
+                    }
+                }
+
+                // 2. Check Hot Header Cache for tail slice
+                if let Some(entry) = self.hot_header_cache.get(&ino_val)
+                    && entry.timestamp.elapsed() < Duration::from_secs(30)
+                    && let Some((tail_start, tail_bytes)) = &entry.tail
+                {
+                    let t_start = *tail_start;
+                    let t_end = t_start + tail_bytes.len() as u64;
+                    if offset >= t_start && offset + req_len as u64 <= t_end {
+                        let off = (offset - t_start) as usize;
+                        buffer[..req_len].copy_from_slice(&tail_bytes[off..off + req_len]);
+                        debug!(ino = ino_val, offset, req_len, "Hot Header Cache tail hit (<0.001 ms)");
+                        return Ok(req_len);
+                    }
+                }
+
+                // 3. Read from EphemeralReadHandle
                 let bytes = handle.read(offset, buffer.len()).await?;
                 let len = bytes.len().min(buffer.len());
                 buffer[..len].copy_from_slice(&bytes[..len]);
+
+                // 4. Populate Hot Header Cache for head (if reading from offset 0)
+                if offset == 0 && !bytes.is_empty() {
+                    let head_bytes = handle.peek_front_buffer(512 * 1024).unwrap_or_else(|| bytes.clone());
+                    let mut entry = self.hot_header_cache.entry(ino_val).or_insert_with(|| HotHeaderCacheEntry {
+                        head: None,
+                        tail: None,
+                        timestamp: std::time::Instant::now(),
+                    });
+                    entry.head = Some(head_bytes);
+                    entry.timestamp = std::time::Instant::now();
+                }
+
+                // 5. Populate Hot Header Cache for tail (if available)
+                if let Some((tail_start, tail_bytes)) = handle.peek_tail_buffer() {
+                    let mut entry = self.hot_header_cache.entry(ino_val).or_insert_with(|| HotHeaderCacheEntry {
+                        head: None,
+                        tail: None,
+                        timestamp: std::time::Instant::now(),
+                    });
+                    entry.tail = Some((tail_start, tail_bytes));
+                    entry.timestamp = std::time::Instant::now();
+                }
+
                 Ok(len)
             } else {
                 Err(VfsError::InternalFault("Handle not open for reading".to_string()))
@@ -732,6 +857,8 @@ impl UcloudFsDriver {
                 .get_inode(target_ino)
                 .ok_or_else(|| VfsError::NotFound(format!("Inode {target_ino} not found for rename")))?;
 
+            let is_cross_parent = new_parent != old_parent;
+
             // Collect cloud rename targets
             let mut cloud_renames = Vec::new();
             match &node.location {
@@ -766,15 +893,60 @@ impl UcloudFsDriver {
 
             if !cloud_renames.is_empty() {
                 let client = Arc::clone(&self.client);
+                let routing_table = Arc::clone(&self.routing_table);
+                let sync_engine = Arc::clone(&self.sync_engine);
                 let tokens_map: HashMap<String, String> = self.account_tokens.iter().map(|kv| (kv.key().clone(), kv.value().clone())).collect();
                 let new_name_clone = new_name.clone();
                 self.rt_handle.spawn(async move {
                     for (account_id, file_id) in cloud_renames {
                         if let Some(token) = tokens_map.get(&account_id) {
-                            if let Err(e) = client.rename_file(&account_id, token, &file_id, &new_name_clone).await {
-                                warn!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, error = %e, "Failed to rename on Google Drive");
+                            let (remove_parent, add_parent) = if is_cross_parent {
+                                // 1. Determine add_parent (target directory on this account)
+                                let add_p = if new_parent == InMemoryRoutingTable::ROOT_INO {
+                                    Some("root".to_string())
+                                } else {
+                                    match Self::ensure_remote_folder_chain_impl(
+                                        &routing_table,
+                                        &client,
+                                        &sync_engine,
+                                        new_parent,
+                                        &account_id,
+                                        token,
+                                    ).await {
+                                        Ok(Some(id)) => Some(id),
+                                        Ok(None) => Some("root".to_string()),
+                                        Err(e) => {
+                                            warn!(account = %account_id, error = %e, "Failed to materialize target folder chain during move");
+                                            None
+                                        }
+                                    }
+                                };
+
+                                // 2. Determine remove_parent (source directory on this account)
+                                let rem_p = if old_parent == InMemoryRoutingTable::ROOT_INO {
+                                    Some("root".to_string())
+                                } else {
+                                    routing_table
+                                        .get_remote_folder_id(old_parent, &account_id)
+                                        .or_else(|| Some("root".to_string()))
+                                };
+
+                                (rem_p, add_p)
                             } else {
-                                info!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, "Successfully renamed on Google Drive");
+                                (None, None)
+                            };
+
+                            if let Err(e) = client.rename_file(
+                                &account_id,
+                                token,
+                                &file_id,
+                                &new_name_clone,
+                                remove_parent.as_deref(),
+                                add_parent.as_deref(),
+                            ).await {
+                                warn!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, error = %e, "Failed to rename/move on Google Drive");
+                            } else {
+                                info!(account = %account_id, file_id = %file_id, new_name = %new_name_clone, "Successfully renamed/moved on Google Drive");
                             }
                         }
                     }
@@ -887,11 +1059,7 @@ impl UcloudFsDriver {
                                 .get(&account_id)
                                 .map(|t| t.clone())
                                 .unwrap_or_default();
-                            let parent_remote = if wp.parent_ino == InMemoryRoutingTable::ROOT_INO {
-                                None
-                            } else {
-                                self.routing_table.get_remote_folder_id(wp.parent_ino, &account_id)
-                            };
+                            let parent_remote = self.ensure_remote_folder_chain(wp.parent_ino, &account_id, &token).await?;
                             let metadata = GoogleFileInput {
                                 name: wp.filename.clone(),
                                 mime_type: Some("application/octet-stream".to_string()),

@@ -215,6 +215,26 @@ async fn setup_mock_server(server: &MockServer, storage: Arc<MockCloudStorage>) 
         .respond_with(ResponseTemplate::new(204))
         .mount(server)
         .await;
+
+    // Folder create for on-demand lazy materialization (POST /drive/v3/files)
+    Mock::given(method("POST"))
+        .and(path("/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "mock_created_folder_id",
+            "name": "testdir",
+            "mimeType": "application/vnd.google-apps.folder"
+        })))
+        .mount(server)
+        .await;
+
+    // File rename / move (PATCH /drive/v3/files/.*)
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "mock_patched_id",
+            "name": "mock_renamed"
+        })))
+        .mount(server)
+        .await;
 }
 
 /// Dynamically locates an unused drive letter scanning downwards from Y: to E:
@@ -349,13 +369,23 @@ async fn test_winfsp_real_kernel_mount() {
     assert_eq!(read_nested, nested_data, "Nested file data must match byte-for-byte");
     println!("Verified nested directory file read/write");
 
+    // 6b. Genuine Windows Kernel cross-directory move (rename from root into subfolder)
+    let moved_path = format!("{test_dir_path}\\hello_moved.txt");
+    std::fs::rename(&hello_path, &moved_path)
+        .expect("std::fs::rename cross-parent move through WinFsp kernel driver");
+    assert!(!std::path::Path::new(&hello_path).exists(), "Old path must no longer exist after move");
+    let read_moved = std::fs::read(&moved_path)
+        .expect("std::fs::read moved file through WinFsp kernel driver");
+    assert_eq!(read_moved, test_data, "Moved file data must match byte-for-byte");
+    println!("Verified cross-directory file move through kernel driver");
+
     // 7. Cleanup operations via Windows Kernel std::fs calls
     std::fs::remove_file(&nested_file_path)
         .expect("std::fs::remove_file nested.txt through WinFsp kernel driver");
+    std::fs::remove_file(&moved_path)
+        .expect("std::fs::remove_file hello_moved.txt through WinFsp kernel driver");
     std::fs::remove_dir(&test_dir_path)
         .expect("std::fs::remove_dir testdir through WinFsp kernel driver");
-    std::fs::remove_file(&hello_path)
-        .expect("std::fs::remove_file hello.txt through WinFsp kernel driver");
     println!("Cleaned up files and directories via kernel filesystem calls");
 
     // 8. Clean Unmount verification

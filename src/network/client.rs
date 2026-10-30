@@ -553,15 +553,31 @@ impl GoogleDriveClient {
         Ok(())
     }
 
-    /// Renames a file or folder on Google Drive via PATCH /drive/v3/files/{file_id}.
+    /// Renames or moves a file or folder on Google Drive via PATCH /drive/v3/files/{file_id}.
     pub async fn rename_file(
         &self,
         account_id: &str,
         access_token: &str,
         file_id: &str,
         new_name: &str,
+        remove_parents: Option<&str>,
+        add_parents: Option<&str>,
     ) -> Result<(), VfsError> {
-        let url = format!("{}/drive/v3/files/{}", self.base_url, file_id);
+        let mut query_params = Vec::new();
+        if let Some(add) = add_parents {
+            query_params.push(format!("addParents={add}"));
+        }
+        if let Some(rem) = remove_parents {
+            query_params.push(format!("removeParents={rem}"));
+        }
+
+        let query_string = if query_params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query_params.join("&"))
+        };
+
+        let url = format!("{}/drive/v3/files/{}{}", self.base_url, file_id, query_string);
         let token_header = format!("Bearer {access_token}");
         let body = serde_json::json!({ "name": new_name });
 
