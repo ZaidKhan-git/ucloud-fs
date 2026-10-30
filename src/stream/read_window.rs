@@ -187,6 +187,9 @@ pub struct EphemeralReadHandle {
     tail_buffer: Vec<u8>,
     tail_capacity: usize,
     reservation: Option<MemoryReservation>,
+    enable_prefetch: bool,
+    prefetch_task: Option<tokio::task::JoinHandle<Result<Bytes, VfsError>>>,
+    prefetch_next_offset: u64,
 }
 
 impl EphemeralReadHandle {
@@ -220,28 +223,39 @@ impl EphemeralReadHandle {
         forward_capacity: usize,
         tail_capacity: usize,
     ) -> Result<Self, VfsError> {
+        let file_size = source.file_size();
+        let forward_capacity = forward_capacity.min(file_size as usize).max(64 * 1024);
+        let tail_capacity = tail_capacity.min(file_size as usize);
+
         let total_needed = forward_capacity + tail_capacity;
-        let min_needed = (1024 * 1024) + tail_capacity;
+        let min_needed = (64 * 1024).min(total_needed);
 
         let reservation = valve
             .acquire_or_shrink(total_needed, min_needed)
             .ok_or(VfsError::DiskFull)?;
 
-        let actual_forward_cap = reservation.allocated_bytes().saturating_sub(tail_capacity);
-        let file_size = source.file_size();
+        let actual_forward_cap = reservation.allocated_bytes().saturating_sub(tail_capacity).max(64 * 1024);
 
         Ok(Self {
             fh,
             source,
             file_size,
             forward_start_offset: 0,
-            forward_buffer: VecDeque::with_capacity(actual_forward_cap),
+            forward_buffer: VecDeque::new(),
             forward_capacity: actual_forward_cap,
             tail_start_offset: None,
-            tail_buffer: Vec::with_capacity(tail_capacity),
+            tail_buffer: Vec::new(),
             tail_capacity,
             reservation: Some(reservation),
+            enable_prefetch: false,
+            prefetch_task: None,
+            prefetch_next_offset: 0,
         })
+    }
+
+    /// Toggles proactive background prefetching for smooth video/audio playback.
+    pub fn enable_prefetch(&mut self, enable: bool) {
+        self.enable_prefetch = enable;
     }
 
     /// Reads up to `len` bytes starting at `offset`.
@@ -304,9 +318,20 @@ impl EphemeralReadHandle {
 
     /// Serves sequential and small forward reads using the sliding window with fast slice copying.
     async fn read_from_forward_window(&mut self, offset: u64, len: usize) -> Result<Bytes, VfsError> {
-        let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+        // 1. Ingest finished background prefetch task without blocking
+        if let Some(task) = &self.prefetch_task
+            && task.is_finished()
+            && let Some(task) = self.prefetch_task.take()
+            && let Ok(Ok(bytes)) = task.await
+        {
+            let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+            if self.prefetch_next_offset == current_end {
+                self.forward_buffer.extend(bytes);
+            }
+        }
 
-        // Check for Forward Cache Hit
+        // 2. Check for Forward Cache Hit
+        let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
         if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
             let rel_offset = (offset - self.forward_start_offset) as usize;
             if rel_offset > 0 {
@@ -316,17 +341,91 @@ impl EphemeralReadHandle {
 
             let copy_len = len.min(self.forward_buffer.len());
             let (s1, s2) = self.forward_buffer.as_slices();
-            if copy_len <= s1.len() {
-                return Ok(Bytes::copy_from_slice(&s1[..copy_len]));
+            let result = if copy_len <= s1.len() {
+                Bytes::copy_from_slice(&s1[..copy_len])
             } else {
                 let mut out = Vec::with_capacity(copy_len);
                 out.extend_from_slice(s1);
                 out.extend_from_slice(&s2[..copy_len - s1.len()]);
-                return Ok(Bytes::from(out));
+                Bytes::from(out)
+            };
+
+            // Non-blocking proactive prefetch: spawn background fetch if buffer is below half capacity
+            if self.enable_prefetch && self.prefetch_task.is_none() && self.forward_buffer.len() <= self.forward_capacity / 2 {
+                let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+                if current_end < self.file_size {
+                    let prefetch_cap = (self.forward_capacity / 2).max(1024 * 1024);
+                    let fetch_len = (prefetch_cap as u64).min(self.file_size - current_end);
+                    if fetch_len > 0 {
+                        let fetch_end = (current_end + fetch_len).saturating_sub(1);
+                        let source = Arc::clone(&self.source);
+                        self.prefetch_next_offset = current_end;
+                        self.prefetch_task = Some(tokio::spawn(async move {
+                            source.fetch_range(current_end, fetch_end).await
+                        }));
+                    }
+                }
+            }
+
+            return Ok(result);
+        }
+
+        // 3. Forward Buffer exhausted: If an in-flight prefetch covers this sequential continuation, await it
+        if let Some(task) = self.prefetch_task.take() {
+            let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+            if self.prefetch_next_offset == current_end {
+                if let Ok(Ok(bytes)) = task.await {
+                    self.forward_buffer.extend(bytes);
+                }
+            } else {
+                task.abort();
             }
         }
 
-        // Forward Cache Miss: Clear old forward window
+        // Re-check after awaiting in-flight prefetch
+        let forward_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+        if offset >= self.forward_start_offset && offset + len as u64 <= forward_end {
+            let rel_offset = (offset - self.forward_start_offset) as usize;
+            if rel_offset > 0 {
+                self.forward_buffer.drain(..rel_offset);
+                self.forward_start_offset = offset;
+            }
+
+            let copy_len = len.min(self.forward_buffer.len());
+            let (s1, s2) = self.forward_buffer.as_slices();
+            let result = if copy_len <= s1.len() {
+                Bytes::copy_from_slice(&s1[..copy_len])
+            } else {
+                let mut out = Vec::with_capacity(copy_len);
+                out.extend_from_slice(s1);
+                out.extend_from_slice(&s2[..copy_len - s1.len()]);
+                Bytes::from(out)
+            };
+
+            // Spawn next prefetch if needed
+            if self.enable_prefetch && self.prefetch_task.is_none() && self.forward_buffer.len() <= self.forward_capacity / 2 {
+                let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+                if current_end < self.file_size {
+                    let prefetch_cap = (self.forward_capacity / 2).max(1024 * 1024);
+                    let fetch_len = (prefetch_cap as u64).min(self.file_size - current_end);
+                    if fetch_len > 0 {
+                        let fetch_end = (current_end + fetch_len).saturating_sub(1);
+                        let source = Arc::clone(&self.source);
+                        self.prefetch_next_offset = current_end;
+                        self.prefetch_task = Some(tokio::spawn(async move {
+                            source.fetch_range(current_end, fetch_end).await
+                        }));
+                    }
+                }
+            }
+
+            return Ok(result);
+        }
+
+        // 4. Genuine Seek or Initial Load: Clear old forward window
+        if let Some(task) = self.prefetch_task.take() {
+            task.abort();
+        }
         self.forward_buffer.make_contiguous().fill(0);
         self.forward_buffer.clear();
 
@@ -347,14 +446,33 @@ impl EphemeralReadHandle {
 
         let copy_len = len.min(self.forward_buffer.len());
         let (s1, s2) = self.forward_buffer.as_slices();
-        if copy_len <= s1.len() {
-            Ok(Bytes::copy_from_slice(&s1[..copy_len]))
+        let result = if copy_len <= s1.len() {
+            Bytes::copy_from_slice(&s1[..copy_len])
         } else {
             let mut out = Vec::with_capacity(copy_len);
             out.extend_from_slice(s1);
             out.extend_from_slice(&s2[..copy_len - s1.len()]);
-            Ok(Bytes::from(out))
+            Bytes::from(out)
+        };
+
+        // Immediately start background prefetch for the NEXT segment
+        if self.enable_prefetch {
+            let current_end = self.forward_start_offset + self.forward_buffer.len() as u64;
+            if current_end < self.file_size {
+                let prefetch_cap = (self.forward_capacity / 2).max(1024 * 1024);
+                let prefetch_len = (prefetch_cap as u64).min(self.file_size - current_end);
+                if prefetch_len > 0 {
+                    let prefetch_end = (current_end + prefetch_len).saturating_sub(1);
+                    let source = Arc::clone(&self.source);
+                    self.prefetch_next_offset = current_end;
+                    self.prefetch_task = Some(tokio::spawn(async move {
+                        source.fetch_range(current_end, prefetch_end).await
+                    }));
+                }
+            }
         }
+
+        Ok(result)
     }
 
     /// Total active heap RAM currently occupied by forward and tail buffers in bytes.
@@ -378,6 +496,10 @@ impl EphemeralReadHandle {
 
 impl Drop for EphemeralReadHandle {
     fn drop(&mut self) {
+        if let Some(task) = self.prefetch_task.take() {
+            task.abort();
+        }
+
         // Zeroize memory buffers before dropping
         self.forward_buffer.make_contiguous().fill(0);
         self.forward_buffer.clear();

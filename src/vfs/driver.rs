@@ -459,13 +459,14 @@ impl UcloudFsDriver {
                 }
             };
 
-            let read_handle = EphemeralReadHandle::with_capacities(
+            let mut read_handle = EphemeralReadHandle::with_capacities(
                 self.allocate_fh(),
                 byte_source,
                 &self.valve,
-                16 * 1024 * 1024, // 16 MB forward window for smooth 1080p video streaming
+                32 * 1024 * 1024, // 32 MB forward window for smooth 1080p video streaming
                 512 * 1024,       // 512 KB tail window
             )?;
+            read_handle.enable_prefetch(true);
             let fh = read_handle.fh();
 
             let _ = self.sync_engine.register_open_handle(ino);
@@ -512,9 +513,9 @@ impl UcloudFsDriver {
         })
     }
 
-    /// Creates a new directory and spawns cloud folder creation on all linked Google accounts.
+    /// Creates a new directory and synchronously creates cloud folders on all linked Google accounts.
     pub fn create_directory(&self, path: &str) -> Result<u64, VfsError> {
-        self.execute_vfs_op(Some(path), || {
+        self.execute_vfs_async_op(Some(path), || async {
             let (parent_ino, dirname) = self.resolve_path_parent_and_name(path)?;
             let ino = self.routing_table.create_virtual_directory(parent_ino, &dirname)?;
             let fh = self.allocate_fh();
@@ -526,57 +527,50 @@ impl UcloudFsDriver {
             let parent_path = self.routing_table.get_path_for_inode(parent_ino).unwrap_or_else(|| "/".to_string());
             self.notifier.notify_updated(&parent_path);
 
-            // Asynchronously dispatch remote folder creation to Google Drive
-            let client = Arc::clone(&self.client);
-            let routing_table = Arc::clone(&self.routing_table);
-            let sync_engine = Arc::clone(&self.sync_engine);
-            let dirname_clone = dirname.clone();
             let tokens: Vec<(String, String)> = self
                 .account_tokens
                 .iter()
                 .map(|kv| (kv.key().clone(), kv.value().clone()))
                 .collect();
 
-            self.rt_handle.spawn(async move {
-                for (account_id, token) in tokens {
-                    let parent_remote = if parent_ino == InMemoryRoutingTable::ROOT_INO {
-                        None
-                    } else {
-                        routing_table.get_remote_folder_id(parent_ino, &account_id)
-                    };
+            for (account_id, token) in tokens {
+                let parent_remote = if parent_ino == InMemoryRoutingTable::ROOT_INO {
+                    None
+                } else {
+                    self.routing_table.get_remote_folder_id(parent_ino, &account_id)
+                };
 
-                    match client
-                        .create_folder(
-                            &account_id,
-                            &token,
-                            &dirname_clone,
-                            parent_remote.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(remote_id) => {
-                            routing_table.record_remote_folder_id(ino, &account_id, &remote_id);
-                            sync_engine.record_local_upsert(&account_id, &remote_id);
-                            info!(
-                                account = %account_id,
-                                dirname = %dirname_clone,
-                                remote_id = %remote_id,
-                                "Created remote folder on Google Drive"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                account = %account_id,
-                                dirname = %dirname_clone,
-                                error = %e,
-                                "Failed to create remote folder on Google Drive"
-                            );
-                        }
+                match self.client
+                    .create_folder(
+                        &account_id,
+                        &token,
+                        &dirname,
+                        parent_remote.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(remote_id) => {
+                        self.routing_table.record_remote_folder_id(ino, &account_id, &remote_id);
+                        self.sync_engine.record_local_upsert(&account_id, &remote_id);
+                        info!(
+                            account = %account_id,
+                            dirname = %dirname,
+                            remote_id = %remote_id,
+                            "Created remote folder on Google Drive"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            account = %account_id,
+                            dirname = %dirname,
+                            error = %e,
+                            "Failed to create remote folder on Google Drive"
+                        );
                     }
                 }
-            });
+            }
 
-            debug!(fh, path, ino, "Created virtual directory handle and spawned cloud folder creation");
+            debug!(fh, path, ino, "Created virtual directory handle and synchronized cloud folder");
             Ok(fh)
         })
     }

@@ -577,6 +577,26 @@ async fn cmd_test_live() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error>> {
+    // Acquire system-wide singleton mutex to prevent dual-process collision
+    let mutex_name: Vec<u16> = "Global\\ucloud_fs_daemon_singleton_lock\0".encode_utf16().collect();
+    let mutex_handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateMutexW(
+            std::ptr::null(),
+            1, // TRUE - acquire initial ownership
+            mutex_name.as_ptr(),
+        )
+    };
+    if mutex_handle.is_null() || unsafe { windows_sys::Win32::Foundation::GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        if !mutex_handle.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(mutex_handle); }
+        }
+        eprintln!("\n[ERROR] Another instance of ucloud-fs is already running.");
+        eprintln!("Please terminate existing ucloud-fs processes first before mounting.\n");
+        return Err(Box::new(VfsError::InternalFault(
+            "Another instance of ucloud-fs is already running".to_string(),
+        )));
+    }
+
     let mut creds = load_vault_credentials().await?;
     if creds.is_empty() {
         return Err(Box::new(VfsError::PermissionDenied(
@@ -733,6 +753,9 @@ async fn cmd_mount(drive_letter: String) -> Result<(), Box<dyn std::error::Error
 
     sync_task.abort();
     let _ = mount_guard.unmount();
+    unsafe {
+        windows_sys::Win32::Foundation::CloseHandle(mutex_handle);
+    }
     println!("ucloud-fs successfully unmounted. Ephemeral caches purged. Goodbye!\n");
 
     Ok(())

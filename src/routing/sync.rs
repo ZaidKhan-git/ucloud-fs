@@ -187,13 +187,31 @@ impl DeltaSyncEngine {
                     if let Some(node) = self.routing_table.get_inode(ino) {
                         let is_striped = matches!(node.location, StorageLocation::StripedManifest { .. });
                         let _ = self.routing_table.remove(node.parent_ino, &node.name);
-                        self.notifier.notify_deleted(&format!("/{}", node.name));
+                        let del_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
+                            if parent_path == "/" || parent_path.is_empty() {
+                                format!("/{}", node.name)
+                            } else {
+                                format!("{}/{}", parent_path.trim_end_matches('/'), node.name)
+                            }
+                        } else {
+                            format!("/{}", node.name)
+                        };
+                        self.notifier.notify_deleted(&del_path);
                         stats.deleted += 1;
 
                         if is_striped {
                             let warning_name = format!("{}.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt", node.name);
                             if self.routing_table.remove(node.parent_ino, &warning_name).is_ok() {
-                                self.notifier.notify_deleted(&format!("/{}", warning_name));
+                                let warn_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
+                                    if parent_path == "/" || parent_path.is_empty() {
+                                        format!("/{}", warning_name)
+                                    } else {
+                                        format!("{}/{}", parent_path.trim_end_matches('/'), warning_name)
+                                    }
+                                } else {
+                                    format!("/{}", warning_name)
+                                };
+                                self.notifier.notify_deleted(&warn_path);
                             }
                         }
 
@@ -257,7 +275,18 @@ impl DeltaSyncEngine {
                             Some(account_id),
                             Some(file_id),
                         )?;
-                        self.notifier.notify_created(&file.name);
+                        let full_path = if parent_ino == InMemoryRoutingTable::ROOT_INO {
+                            file.name.clone()
+                        } else if let Some(parent_path) = self.routing_table.get_path_for_inode(parent_ino) {
+                            if parent_path == "/" || parent_path.is_empty() {
+                                file.name.clone()
+                            } else {
+                                format!("{}/{}", parent_path.trim_end_matches('/'), file.name)
+                            }
+                        } else {
+                            file.name.clone()
+                        };
+                        self.notifier.notify_created(&full_path);
                         stats.created += 1;
                         info!(
                             account = %account_id,
@@ -283,7 +312,18 @@ impl DeltaSyncEngine {
                             web_view_link: None,
                         })?;
 
-                        self.notifier.notify_created(&file.name);
+                        let full_path = if parent_ino == InMemoryRoutingTable::ROOT_INO {
+                            file.name.clone()
+                        } else if let Some(parent_path) = self.routing_table.get_path_for_inode(parent_ino) {
+                            if parent_path == "/" || parent_path.is_empty() {
+                                file.name.clone()
+                            } else {
+                                format!("{}/{}", parent_path.trim_end_matches('/'), file.name)
+                            }
+                        } else {
+                            file.name.clone()
+                        };
+                        self.notifier.notify_created(&full_path);
                         stats.created += 1;
                         info!(
                             account = %account_id,

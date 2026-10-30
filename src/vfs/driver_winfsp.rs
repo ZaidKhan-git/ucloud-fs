@@ -322,9 +322,29 @@ unsafe impl Sync for MountContext {}
 /// Context attached to an open file handle (`*FileContext`).
 struct WinFspFileContext {
     fh: u64,
-    path: String,
+    path: std::sync::RwLock<String>,
     is_directory: bool,
     delete_on_cleanup: AtomicBool,
+}
+
+impl WinFspFileContext {
+    fn new(fh: u64, path: String, is_directory: bool) -> Self {
+        Self {
+            fh,
+            path: std::sync::RwLock::new(path),
+            is_directory,
+            delete_on_cleanup: AtomicBool::new(false),
+        }
+    }
+
+    fn get_path(&self) -> String {
+        self.path.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_path(&self, new_path: String) {
+        let mut lock = self.path.write().unwrap_or_else(|e| e.into_inner());
+        *lock = new_path;
+    }
 }
 
 /// Converts UTF-16 null-terminated pointer into Rust String.
@@ -552,12 +572,7 @@ unsafe extern "system" fn create_cb(
             }
         };
 
-        let ctx = Box::new(WinFspFileContext {
-            fh,
-            path: path.clone(),
-            is_directory: is_dir,
-            delete_on_cleanup: AtomicBool::new(false),
-        });
+        let ctx = Box::new(WinFspFileContext::new(fh, path.clone(), is_dir));
         *p_file_context = Box::into_raw(ctx) as *mut c_void;
 
         if !file_info.is_null() {
@@ -609,12 +624,7 @@ unsafe extern "system" fn open_cb(
             Err(e) => return vfs_error_to_ntstatus(&e),
         };
 
-        let ctx = Box::new(WinFspFileContext {
-            fh,
-            path,
-            is_directory: info.is_directory,
-            delete_on_cleanup: AtomicBool::new(false),
-        });
+        let ctx = Box::new(WinFspFileContext::new(fh, path, info.is_directory));
         *p_file_context = Box::into_raw(ctx) as *mut c_void;
 
         if !file_info.is_null() {
@@ -655,7 +665,7 @@ unsafe extern "system" fn overwrite_cb(
         if !file_info.is_null() {
             if let Ok(info) = mount_ctx.driver.get_file_info_by_handle(ctx.fh) {
                 populate_fsp_file_info(file_info, &info);
-            } else if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.path) {
+            } else if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.get_path()) {
                 populate_fsp_file_info(file_info, &info);
             }
         }
@@ -684,7 +694,7 @@ unsafe extern "system" fn cleanup_cb(
 
         const FSP_CLEANUP_DELETE: u32 = 0x01;
         if (flags & FSP_CLEANUP_DELETE) != 0 || ctx.delete_on_cleanup.load(Ordering::SeqCst) {
-            let _ = mount_ctx.driver.delete(&ctx.path);
+            let _ = mount_ctx.driver.delete(&ctx.get_path());
         } else {
             let _ = mount_ctx.driver.cleanup(ctx.fh);
         }
@@ -773,7 +783,7 @@ unsafe extern "system" fn write_cb(
                 if !file_info.is_null() {
                     if let Ok(info) = mount_ctx.driver.get_file_info_by_handle(ctx.fh) {
                         populate_fsp_file_info(file_info, &info);
-                    } else if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.path) {
+                    } else if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.get_path()) {
                         populate_fsp_file_info(file_info, &info);
                     }
                 }
@@ -803,7 +813,7 @@ unsafe extern "system" fn flush_cb(
         {
             let mount_ctx = &*((*fs).user_context as *const MountContext);
             let ctx = &*(file_context as *const WinFspFileContext);
-            if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.path) {
+            if let Ok(info) = mount_ctx.driver.get_file_info(&ctx.get_path()) {
                 populate_fsp_file_info(file_info, &info);
             }
         }
@@ -835,7 +845,7 @@ unsafe extern "system" fn get_file_info_cb(
         let res = mount_ctx
             .driver
             .get_file_info_by_handle(ctx.fh)
-            .or_else(|_| mount_ctx.driver.get_file_info(&ctx.path));
+            .or_else(|_| mount_ctx.driver.get_file_info(&ctx.get_path()));
         match res {
             Ok(info) => {
                 populate_fsp_file_info(file_info, &info);
@@ -872,7 +882,7 @@ unsafe extern "system" fn set_basic_info_cb(
             let res = mount_ctx
                 .driver
                 .get_file_info_by_handle(ctx.fh)
-                .or_else(|_| mount_ctx.driver.get_file_info(&ctx.path));
+                .or_else(|_| mount_ctx.driver.get_file_info(&ctx.get_path()));
             if let Ok(mut info) = res {
                 if file_attributes != 0 && file_attributes != u32::MAX {
                     info.file_attributes = file_attributes;
@@ -911,7 +921,7 @@ unsafe extern "system" fn set_file_size_cb(
             let res = mount_ctx
                 .driver
                 .get_file_info_by_handle(ctx.fh)
-                .or_else(|_| mount_ctx.driver.get_file_info(&ctx.path));
+                .or_else(|_| mount_ctx.driver.get_file_info(&ctx.get_path()));
             if let Ok(mut info) = res {
                 info.size = new_size;
                 info.allocation_size = new_size;
@@ -940,7 +950,7 @@ unsafe extern "system" fn can_delete_cb(
         let ctx = &*(file_context as *const WinFspFileContext);
 
         if ctx.is_directory
-            && let Ok(entries) = mount_ctx.driver.read_directory(&ctx.path)
+            && let Ok(entries) = mount_ctx.driver.read_directory(&ctx.get_path())
             && !entries.is_empty()
         {
             return STATUS_DIRECTORY_NOT_EMPTY;
@@ -1002,7 +1012,7 @@ unsafe extern "system" fn rename_cb(
             return vfs_error_to_ntstatus(&e);
         }
 
-        ctx.path = new_path;
+        ctx.set_path(new_path);
         STATUS_SUCCESS
     }));
 
@@ -1079,13 +1089,14 @@ unsafe extern "system" fn read_directory_cb(
         *p_bytes_transferred = 0;
         let mount_ctx = &*((*fs).user_context as *const MountContext);
         let ctx = &*(file_context as *const WinFspFileContext);
+        let dir_path = ctx.get_path();
 
-        let children = match mount_ctx.driver.read_directory(&ctx.path) {
+        let children = match mount_ctx.driver.read_directory(&dir_path) {
             Ok(c) => c,
             Err(e) => return vfs_error_to_ntstatus(&e),
         };
 
-        let curr_info = mount_ctx.driver.get_file_info(&ctx.path).unwrap_or(FileInfo {
+        let curr_info = mount_ctx.driver.get_file_info(&dir_path).unwrap_or(FileInfo {
             ino: 1,
             size: 0,
             allocation_size: 0,
@@ -1096,7 +1107,7 @@ unsafe extern "system" fn read_directory_cb(
             file_attributes: FILE_ATTRIBUTE_DIRECTORY,
         });
 
-        let is_root = ctx.path == "/" || ctx.path.is_empty() || ctx.path == "\\";
+        let is_root = dir_path == "/" || dir_path.is_empty() || dir_path == "\\";
         let mut all_entries = Vec::with_capacity(children.len() + 2);
         if !is_root {
             all_entries.push(DirEntry {
@@ -1186,94 +1197,6 @@ unsafe extern "system" fn read_directory_cb(
     }
 }
 
-unsafe extern "system" fn get_dir_info_by_name_cb(
-    fs: *mut FspFileSystem,
-    file_context: *mut c_void,
-    file_name: *const u16,
-    dir_info: *mut FspFsctlDirInfo,
-) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        if fs.is_null()
-            || (*fs).user_context.is_null()
-            || file_context.is_null()
-            || file_name.is_null()
-            || dir_info.is_null()
-        {
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        let mount_ctx = &*((*fs).user_context as *const MountContext);
-        let ctx = &*(file_context as *const WinFspFileContext);
-
-        let child_name = match pwstr_to_string(file_name) {
-            Some(n) if !n.is_empty() => n,
-            _ => return STATUS_OBJECT_NAME_NOT_FOUND,
-        };
-
-        if crate::vfs::sandbox::is_shell_noise(&child_name) {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-
-        let (info, reported_name) = if child_name == "." {
-            let info = mount_ctx.driver.get_file_info(&ctx.path).unwrap_or(FileInfo {
-                ino: 1,
-                size: 0,
-                allocation_size: 0,
-                is_directory: true,
-                is_readonly: false,
-                created_time: 0,
-                modified_time: 0,
-                file_attributes: FILE_ATTRIBUTE_DIRECTORY,
-            });
-            (info, child_name)
-        } else if child_name == ".." {
-            let parent_path = if ctx.path == "/" || ctx.path == "\\" || ctx.path.is_empty() {
-                "/".to_string()
-            } else if let Some((p, _)) = ctx.path.trim_end_matches(['/', '\\']).rsplit_once(['/', '\\']) {
-                if p.is_empty() {
-                    "/".to_string()
-                } else {
-                    p.to_string()
-                }
-            } else {
-                "/".to_string()
-            };
-            let info = mount_ctx.driver.get_file_info(&parent_path).unwrap_or(FileInfo {
-                ino: 1,
-                size: 0,
-                allocation_size: 0,
-                is_directory: true,
-                is_readonly: false,
-                created_time: 0,
-                modified_time: 0,
-                file_attributes: FILE_ATTRIBUTE_DIRECTORY,
-            });
-            (info, child_name)
-        } else {
-            let clean_ctx = ctx.path.trim_end_matches(['/', '\\']);
-            let child_path = if clean_ctx.is_empty() {
-                format!("/{}", child_name)
-            } else {
-                format!("{}/{}", clean_ctx, child_name)
-            };
-
-            let info = match mount_ctx.driver.get_file_info(&child_path) {
-                Ok(i) => i,
-                Err(_) => return STATUS_OBJECT_NAME_NOT_FOUND,
-            };
-            (info, child_name)
-        };
-
-        populate_fsp_dir_info(dir_info, &info, &reported_name);
-        STATUS_SUCCESS
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => STATUS_UNSUCCESSFUL,
-    }
-}
-
 static WINFSP_INTERFACE: FspFileSystemInterface = FspFileSystemInterface {
     get_volume_info: Some(get_volume_info_cb),
     set_volume_label: Some(set_volume_label_cb),
@@ -1299,7 +1222,7 @@ static WINFSP_INTERFACE: FspFileSystemInterface = FspFileSystemInterface {
     set_reparse_point: None,
     delete_reparse_point: None,
     get_stream_info: None,
-    get_dir_info_by_name: Some(get_dir_info_by_name_cb),
+    get_dir_info_by_name: None,
     control: None,
     set_delete: Some(set_delete_cb),
     create_ex: None,
@@ -1456,7 +1379,6 @@ impl WinFspMountGuard {
             flags: (1 << 1)   // CasePreservedNames
                 | (1 << 2)    // UnicodeOnDisk
                 | (1 << 10)   // PostCleanupWhenModifiedOnly
-                | (1 << 13)   // PassQueryDirectoryFileName (routes single-item queries to get_dir_info_by_name)
                 | (1 << 14)   // FlushAndPurgeOnCleanup
                 | (1 << 16)   // UmFileContextIsUserContext2 (maps FileContext strictly to per-handle UserContext2 file descriptor)
                 | (1 << 24)   // AllowOpenInKernelMode
