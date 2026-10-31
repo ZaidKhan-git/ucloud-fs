@@ -3,7 +3,7 @@
 **Pure-Rust Unified Cloud Virtual Filesystem Daemon** for Windows 11 / 10.
 
 `ucloud-fs` mounts multiple Google Drive accounts into a unified, high-performance local Windows filesystem (`X:` or `Y:`) backed by [WinFsp](https://winfsp.dev/). It behaves like a native physical drive in Windows Explorer, Command Prompt, and PowerShell with zero persistent disk caching and instant progressive video/media streaming.
-## Build with Gemini 3.8 Flash
+Build with Gemini 3.8 Flash
 ---
 
 ## Key Features
