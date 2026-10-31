@@ -3,39 +3,37 @@
 **Pure-Rust Unified Cloud Virtual Filesystem Daemon** for Windows 11 / 10.
 
 `ucloud-fs` mounts multiple Google Drive accounts into a unified, high-performance local Windows filesystem (`X:` or `Y:`) backed by [WinFsp](https://winfsp.dev/). It behaves like a native physical drive in Windows Explorer, Command Prompt, and PowerShell with zero persistent disk caching and instant progressive video/media streaming.
-
 ---
 
-## 🌟 Key Features
+#### Designed by [Me](https://github.com/ZaidKhan-git/). Build with [Gemini](https://gemini.google.com/)
+---
+
+## Key Features
 
 - **Zero Persistent Disk Footprint**: Reads and writes stream directly to/from Google Drive. No massive temporary cache files filling your local SSD.
 - **Sub-Second Progressive Streaming**: Built with a lock-free direct page cache (`SharedBlockCache`) using 512 KB blocks and paced background read-ahead. Media players (e.g. VLC, Windows Media Player) start playing instantly without freezing or buffering pauses.
 - **Multi-Account Storage Pooling & Affinity**: Combines storage across multiple Google accounts. Files inherit parent folder account affinity, while files exceeding single-account capacity are transparently striped across accounts.
-- **Collision Disambiguation**: When different accounts contain folders or files with the same name, `ucloud-fs` disambiguates them cleanly in Windows Explorer (e.g. `Projects (mohdzaidk035)` vs `Projects (ucloudfs)`).
+- **Collision Disambiguation**: When different accounts contain folders or files with the same name, `ucloud-fs` disambiguates them cleanly in Windows Explorer.
 - **3-Pass Topological Delta Sync**: Background engine monitors remote Google Drive changes (`changes.list`) every 10 seconds. Out-of-order hierarchies and remote deletions are reconciled topologically without parent loss, duplicate mirroring, or resurrection loops.
 - **Zeroized Encrypted Vault**: Account OAuth credentials and refresh tokens are protected at rest using `Argon2id` key derivation and authenticated `ChaCha20-Poly1305` encryption, with memory zeroization on drop.
 
 ---
 
-## 📋 Prerequisites
+## Prerequisites
 
 1. **Windows 10 / 11** (64-bit `x86_64`)
 2. **WinFsp**: Install the latest [WinFsp release](https://github.com/winfsp/winfsp/releases) (v2.0 or higher) for kernel-mode filesystem redirection.
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### 1. Authenticate an Account
-
-To use your personal Google Cloud Console OAuth credentials, set the environment variables in PowerShell:
+Move inside executable folder:
 ```powershell
-$env:UCLOUD_CLIENT_ID = "<YOUR_CLIENT_ID>"
-$env:UCLOUD_CLIENT_SECRET = "<YOUR_CLIENT_SECRET>"
+cd ucloud-fs
 ```
-*(Or pass them directly via `--client-id` and `--client-secret`).*
-
-Then initiate authentication:
+Link your Google Drive account using OAuth 2.0 PKCE loopback:
 ```powershell
 ucloud-fs.exe login
 ```
@@ -67,7 +65,7 @@ Open Windows Explorer to browse `X:` as a standard local drive!
 
 ---
 
-## 🛠️ CLI Command Reference
+## CLI Command Reference
 
 | Command | Arguments | Description |
 |---|---|---|
@@ -83,13 +81,13 @@ Open Windows Explorer to browse `X:` as a standard local drive!
 
 ---
 
-## 🔑 Using Your Personal Google OAuth Credentials
+## Using Your Personal Google OAuth Credentials  [Recommended]
 
 > [!IMPORTANT]
 > **Why set up your own Google Cloud project?**
 > By default, `ucloud-fs` includes a built-in project Client ID and Secret for immediate out-of-the-box use. However, because Google marks unverified third-party OAuth apps in **"Testing"** mode, Google blocks access for accounts not explicitly added to that specific project's test users list (showing error: `Error 403: access_denied - ucloud-fs has not completed the Google verification process`).
 >
-> Setting up your own free Google Cloud Console project takes less than 2 minutes and grants you **100% independence**, allowing you to link any of your personal or work accounts without restrictions.
+> Setting up your own free Google Cloud Console project takes less than 2 minutes and grants you **100% independence** from third party client handling sensitive data, allowing you to link any of your personal or work accounts without restrictions.
 
 ### Step-by-Step Setup Guide
 
@@ -167,7 +165,7 @@ ucloud-fs.exe set-credentials --reset
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ```
                       +-----------------------------+
@@ -217,7 +215,7 @@ ucloud-fs.exe set-credentials --reset
 
 ---
 
-## 🧪 Running Tests & Building From Source
+##  Running Tests & Building From Source
 
 Prerequisites for building:
 - Rust toolchain (`x86_64-pc-windows-gnu`)
