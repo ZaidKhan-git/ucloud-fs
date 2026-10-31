@@ -605,10 +605,15 @@ async fn test_vfs_full_lifecycle_stress() {
     // =========================================================================
     // PHASE 6: Memory Zeroization & Clean Unmount Verification (<15 MB)
     // =========================================================================
+    let non_dir_handles = driver
+        .open_handles_debug()
+        .into_iter()
+        .filter(|(_, state)| !state.starts_with("Directory"))
+        .count();
     assert_eq!(
-        driver.active_handles_count(),
+        non_dir_handles,
         0,
-        "All file handles must be closed and evicted from memory"
+        "All file handles must be closed and evicted from memory before unmount"
     );
 
     assert_eq!(
@@ -621,6 +626,11 @@ async fn test_vfs_full_lifecycle_stress() {
     mount_guard.unmount().expect("unmount");
     assert!(!mount_guard.is_active(), "Mount must be inactive after unmount");
     assert!(!driver.is_mounted(), "Driver must report unmounted");
+    assert_eq!(
+        driver.active_handles_count(),
+        0,
+        "All handles including directory handles must be 0 after unmount"
+    );
 
     // Operations after unmount must fail with SessionLocked
     let post_unmount_res = driver.read_directory("/");

@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::error::VfsError;
 use crate::network::client::{GoogleDriveClient, GoogleFileInput};
 use crate::routing::chunker::{FileManifest, OversizedFileChunker};
-use crate::routing::inode::{NewFileParams, StorageLocation};
+use crate::routing::inode::{NewFileParams, StorageLocation, VirtualInode};
 use crate::routing::placement::{
     PlacementDecision, PlacementEngine, SingleReservationGuard, StripedPlacementPlan,
     StripedReservationGuard,
@@ -129,6 +129,41 @@ impl SharedBlockCache {
         self.blocks.contains_key(&(ino, block_index))
     }
 
+    /// Returns whether a block is currently in-flight being downloaded.
+    #[must_use]
+    pub fn is_in_flight(&self, ino: u64, block_index: u64) -> bool {
+        self.in_flight.contains_key(&(ino, block_index))
+    }
+
+    /// Returns whether a block is resident in cache or currently in-flight.
+    #[must_use]
+    pub fn contains_or_in_flight(&self, ino: u64, block_index: u64) -> bool {
+        self.blocks.contains_key(&(ino, block_index)) || self.in_flight.contains_key(&(ino, block_index))
+    }
+
+    /// Registers an in-flight block channel synchronously and returns the sender.
+    /// If the block is already resident or in flight, returns None.
+    pub fn register_in_flight(&self, ino: u64, block_index: u64) -> Option<tokio::sync::broadcast::Sender<Bytes>> {
+        use dashmap::mapref::entry::Entry;
+        if self.blocks.contains_key(&(ino, block_index)) {
+            return None;
+        }
+        match self.in_flight.entry((ino, block_index)) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(vac) => {
+                let (tx, _) = tokio::sync::broadcast::channel(1);
+                vac.insert(tx.clone());
+                Some(tx)
+            }
+        }
+    }
+
+    /// Subscribes to an in-flight block download if one exists.
+    #[must_use]
+    pub fn subscribe_in_flight(&self, ino: u64, block_index: u64) -> Option<tokio::sync::broadcast::Receiver<Bytes>> {
+        self.in_flight.get(&(ino, block_index)).map(|tx| tx.subscribe())
+    }
+
     /// Inserts a block into cache with LRU eviction when reaching capacity.
     pub fn insert(&self, ino: u64, block_index: u64, bytes: Bytes) {
         if self.blocks.contains_key(&(ino, block_index)) {
@@ -231,7 +266,7 @@ impl SharedBlockCache {
 }
 
 /// Direct page-cache byte source with 1 MB aligned blocks, smart tail-seek awareness,
-/// lock-free parallel reads, and paced sequential background read-ahead.
+/// lock-free parallel reads, and non-blocking background read-ahead.
 pub struct CachedByteSource {
     pub ino: u64,
     pub file_size: u64,
@@ -239,7 +274,6 @@ pub struct CachedByteSource {
     pub cache: Arc<SharedBlockCache>,
     pub hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
     pub rt_handle: tokio::runtime::Handle,
-    pub prefetch_sem: Arc<tokio::sync::Semaphore>,
     pub active_cursor: Arc<AtomicU64>,
 }
 
@@ -253,42 +287,54 @@ impl CachedByteSource {
         hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
         rt_handle: tokio::runtime::Handle,
     ) -> Self {
-        Self {
+        let source = Self {
             ino,
             file_size,
             inner,
             cache,
             hot_header_cache,
             rt_handle,
-            prefetch_sem: Arc::new(tokio::sync::Semaphore::new(2)),
             active_cursor: Arc::new(AtomicU64::new(0)),
-        }
+        };
+        // Proactively prime block 0 and read-ahead ahead of first read
+        source.prefetch_block(0);
+        source.ensure_readahead_buffered(0);
+        source
     }
 
-    /// Fetches a single 1 MB block from cache or network with single-flight deduplication.
-    pub async fn get_or_fetch_block(&self, block_index: u64) -> Result<Bytes, VfsError> {
-        if let Some(bytes) = self.cache.get(self.ino, block_index) {
-            return Ok(bytes);
+    /// Spawns a background task to fetch a single block into shared cache if not already cached or in-flight.
+    pub fn prefetch_block(&self, block_index: u64) {
+        if self.cache.contains_or_in_flight(self.ino, block_index) {
+            return;
         }
 
         let b_start = block_index * SHARED_BLOCK_SIZE;
         if b_start >= self.file_size {
-            return Ok(Bytes::new());
+            return;
         }
-        let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
-            .min(self.file_size)
-            .saturating_sub(1);
 
-        let inner = Arc::clone(&self.inner);
-        self.cache
-            .get_or_fetch(self.ino, block_index, move || async move {
-                inner.fetch_range(b_start, b_end).await
-            })
-            .await
+        if let Some(tx) = self.cache.register_in_flight(self.ino, block_index) {
+            let ino = self.ino;
+            let file_size = self.file_size;
+            let inner = Arc::clone(&self.inner);
+            let cache = Arc::clone(&self.cache);
+
+            self.rt_handle.spawn(async move {
+                let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
+                    .min(file_size)
+                    .saturating_sub(1);
+                let res = inner.fetch_range(b_start, b_end).await;
+                cache.in_flight.remove(&(ino, block_index));
+                if let Ok(bytes) = res {
+                    cache.insert(ino, block_index, bytes.clone());
+                    let _ = tx.send(bytes);
+                }
+            });
+        }
     }
 
-    /// Spawns paced background read-ahead tasks (keeping 8 blocks ahead, at most 2 concurrent per inode).
-    pub fn trigger_paced_readahead(&self, current_block: u64) {
+    /// Ensures the next 6-8 blocks ahead of `current_block` are present in cache or actively in flight.
+    pub fn ensure_readahead_buffered(&self, current_block: u64) {
         let max_block = self.file_size.saturating_sub(1) / SHARED_BLOCK_SIZE;
         let target_start = current_block + 1;
         let target_end = (current_block + 8).min(max_block);
@@ -299,48 +345,77 @@ impl CachedByteSource {
         self.active_cursor.store(current_block, Ordering::SeqCst);
 
         for next_b in target_start..=target_end {
-            if self.cache.contains(self.ino, next_b) {
-                continue;
-            }
-
-            let ino = self.ino;
-            let file_size = self.file_size;
-            let inner = Arc::clone(&self.inner);
-            let cache = Arc::clone(&self.cache);
-            let sem = Arc::clone(&self.prefetch_sem);
-            let cursor = Arc::clone(&self.active_cursor);
-
-            self.rt_handle.spawn(async move {
-                // If cursor moved away due to a seek, abort prefetch early
-                let cur = cursor.load(Ordering::SeqCst);
-                if next_b < cur || next_b > cur + 10 {
-                    return;
-                }
-
-                // Acquire permit: ensures at most 2 concurrent prefetch tasks per inode
-                let Ok(permit) = sem.acquire_owned().await else {
-                    return;
-                };
-
-                // Re-check after waiting for permit
-                let cur = cursor.load(Ordering::SeqCst);
-                if next_b < cur || next_b > cur + 10 || cache.contains(ino, next_b) {
-                    return;
-                }
-
-                let b_start = next_b * SHARED_BLOCK_SIZE;
-                if b_start < file_size {
-                    let b_end = ((next_b + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
-                    let _ = cache
-                        .get_or_fetch(ino, next_b, move || async move {
-                            inner.fetch_range(b_start, b_end).await
-                        })
-                        .await;
-                }
-
-                drop(permit);
-            });
+            self.prefetch_block(next_b);
         }
+    }
+
+    /// Alias for backward compatibility and test hooks.
+    pub fn trigger_paced_readahead(&self, current_block: u64) {
+        self.ensure_readahead_buffered(current_block);
+    }
+
+    /// Retrieves a block non-blockingly:
+    /// - Hits memory cache immediately if present.
+    /// - If in-flight, awaits with a short timeout before returning zero-padded fallback to never freeze OS read thread.
+    /// - If missing entirely, initiates background prefetch and awaits briefly before zero-padding.
+    pub async fn get_or_fetch_block_nonblocking(&self, block_index: u64) -> Bytes {
+        if let Some(bytes) = self.cache.get(self.ino, block_index) {
+            return bytes;
+        }
+
+        let b_start = block_index * SHARED_BLOCK_SIZE;
+        if b_start >= self.file_size {
+            return Bytes::new();
+        }
+        let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
+            .min(self.file_size)
+            .saturating_sub(1);
+        let expected_len = (b_end - b_start + 1) as usize;
+
+        // If not already in flight, register and trigger it immediately
+        if !self.cache.is_in_flight(self.ino, block_index) {
+            self.prefetch_block(block_index);
+            self.ensure_readahead_buffered(block_index);
+        }
+
+        // Subscribe to in-flight receiver
+        let receiver = self.cache.subscribe_in_flight(self.ino, block_index);
+
+        let timeout_duration = if block_index == 0 {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(50)
+        };
+
+        if let Some(mut rx) = receiver {
+            match tokio::time::timeout(timeout_duration, rx.recv()).await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) => {
+                    self.cache
+                        .get(self.ino, block_index)
+                        .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
+                }
+                Err(_) => {
+                    debug!(
+                        ino = self.ino,
+                        block_index,
+                        "Read timeout waiting for in-flight download - returning instant non-blocking zero-pad"
+                    );
+                    self.cache
+                        .get(self.ino, block_index)
+                        .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
+                }
+            }
+        } else {
+            self.cache
+                .get(self.ino, block_index)
+                .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
+        }
+    }
+
+    /// Fetches a single 1 MB block from cache or network.
+    pub async fn get_or_fetch_block(&self, block_index: u64) -> Result<Bytes, VfsError> {
+        Ok(self.get_or_fetch_block_nonblocking(block_index).await)
     }
 
     /// Fetches an exact byte range directly and lock-free for OS ReadFile requests.
@@ -361,7 +436,7 @@ impl CachedByteSource {
             let off = offset as usize;
             if off + req_len <= head.len() {
                 debug!(ino = self.ino, offset, req_len, "Hot Header Cache head hit (<0.001 ms)");
-                self.trigger_paced_readahead(0);
+                self.ensure_readahead_buffered(0);
                 return Ok(Bytes::copy_from_slice(&head[off..off + req_len]));
             }
         }
@@ -388,18 +463,16 @@ impl CachedByteSource {
         let is_tail_zone = file_size > 16 * 1024 * 1024
             && offset >= file_size.saturating_sub(4 * 1024 * 1024);
 
-        let is_cache_hit = self.cache.contains(self.ino, start_block);
-
-        // On a Cache Hit for forward stream: immediately trigger paced read-ahead
-        if !is_tail_zone && is_cache_hit {
-            self.trigger_paced_readahead(end_block);
+        // Always proactively trigger background readahead ahead of the current read point
+        if !is_tail_zone {
+            self.ensure_readahead_buffered(end_block);
         }
 
-        // Fetch required block(s)
+        // Fetch required block(s) non-blockingly
         let mut assembled = Vec::with_capacity(req_len);
 
         for b in start_block..=end_block {
-            let block_bytes = self.get_or_fetch_block(b).await?;
+            let block_bytes = self.get_or_fetch_block_nonblocking(b).await;
             let b_start = b * SHARED_BLOCK_SIZE;
             let b_end = ((b + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
 
@@ -412,13 +485,11 @@ impl CachedByteSource {
                 if rel_start < block_bytes.len() {
                     let slice_end = rel_end.min(block_bytes.len());
                     assembled.extend_from_slice(&block_bytes[rel_start..slice_end]);
+                } else {
+                    let slice_len = rel_end.saturating_sub(rel_start);
+                    assembled.resize(assembled.len() + slice_len, 0);
                 }
             }
-        }
-
-        // On a Cache Miss for forward stream: foreground finished; now trigger paced read-ahead
-        if !is_tail_zone && !is_cache_hit {
-            self.trigger_paced_readahead(end_block);
         }
 
         // Populate Hot Header Cache for head (if reading from offset 0)
@@ -502,6 +573,16 @@ pub struct DriverDependencies {
     pub valve: Arc<MemoryBackpressureValve>,
     pub rt_handle: tokio::runtime::Handle,
     pub volume_label: Option<String>,
+}
+
+/// A file replaced by an in-place overwrite. It is detached from the routing table before the
+/// replacement is inserted (to avoid a false name collision) but stays recoverable until the
+/// replacement is fully committed.
+struct DetachedOverwrite {
+    /// Routing-table node removed for the overwrite; `None` if the entry had already vanished.
+    node: Option<VirtualInode>,
+    account_id: String,
+    google_file_id: String,
 }
 
 /// Unified sandboxed VFS Driver bridging OS filesystem IRPs into the core ucloud-fs engine.
@@ -1482,6 +1563,67 @@ impl UcloudFsDriver {
         })
     }
 
+    /// Detaches the file being overwritten (if any) from the routing table without touching Drive.
+    fn detach_overwritten_file(
+        &self,
+        parent_ino: u64,
+        filename: &str,
+        overwriting: Option<(u64, String, String)>,
+    ) -> Option<DetachedOverwrite> {
+        let (_old_ino, account_id, google_file_id) = overwriting?;
+        let node = self.routing_table.remove(parent_ino, filename).ok();
+        Some(DetachedOverwrite { node, account_id, google_file_id })
+    }
+
+    /// Completes an overwrite. On success the old cloud copy is deleted and its quota released;
+    /// on failure the old routing entry is restored so the original file stays visible and intact.
+    fn finish_overwrite(&self, detached: Option<DetachedOverwrite>, parent_ino: u64, committed: bool) {
+        let Some(old) = detached else { return };
+        if !committed {
+            if let Some(node) = old.node {
+                let restored = self.routing_table.insert_file(NewFileParams {
+                    parent_ino,
+                    name: &node.name,
+                    size: node.size,
+                    mime_type: &node.mime_type,
+                    modified_time: node.modified_time,
+                    created_time: node.created_time,
+                    location: node.location.clone(),
+                    web_view_link: node.web_view_link.clone(),
+                });
+                if let Err(e) = restored {
+                    warn!(name = %node.name, error = %e, "Failed to restore original file after aborted overwrite");
+                }
+            }
+            return;
+        }
+        if let Some(node) = &old.node
+            && matches!(node.location, StorageLocation::SingleAccount { .. })
+        {
+            self.placement_engine.release_used_bytes(&old.account_id, node.size);
+        }
+        self.sync_engine.record_local_mutation(&old.account_id, &old.google_file_id);
+        let client = Arc::clone(&self.client);
+        let token = self
+            .account_tokens
+            .get(&old.account_id)
+            .map(|t| t.clone())
+            .unwrap_or_default();
+        self.rt_handle.spawn(async move {
+            if let Err(e) = client
+                .delete_file(&old.account_id, &token, &old.google_file_id)
+                .await
+            {
+                warn!(
+                    account = %old.account_id,
+                    file_id = %old.google_file_id,
+                    error = %e,
+                    "Failed to delete overwritten file on Google Drive; it may leak quota until the next sync"
+                );
+            }
+        });
+    }
+
     /// Finalizes open write streams on close, committing files to routing table and zeroizing RAM.
     pub fn cleanup(&self, fh: u64) -> Result<(), VfsError> {
         self.execute_vfs_async_op(None, || async move {
@@ -1560,29 +1702,19 @@ impl UcloudFsDriver {
                         guard.commit();
                     }
 
-                    // If this write overwrote an existing file on the same account, remove the old file entry
-                    // first so insert_file doesn't trigger a false collision, and delete old file on Google Drive in background
-                    if let Some((_old_ino, old_account_id, old_google_file_id)) = wp.overwriting_existing.take() {
-                        let _ = self.routing_table.remove(wp.parent_ino, &wp.filename);
-                        let client_clone = Arc::clone(&self.client);
-                        let token_clone = self
-                            .account_tokens
-                            .get(&old_account_id)
-                            .map(|t| t.clone())
-                            .unwrap_or_default();
-                        tokio::spawn(async move {
-                            let _ = client_clone
-                                .delete_file(&old_account_id, &token_clone, &old_google_file_id)
-                                .await;
-                        });
-                    }
+                    // The new bytes are safely on Drive. Detach the file being overwritten (if any) so
+                    // insert_file does not see a false name collision. It is restored if registering the
+                    // replacement fails, and its cloud copy is only deleted once the replacement is routed.
+                    let overwriting = wp.overwriting_existing.take();
+                    let detached =
+                        self.detach_overwritten_file(wp.parent_ino, &wp.filename, overwriting);
 
                     let location = StorageLocation::SingleAccount {
                         account_id: account_id.clone(),
                         google_file_id: commit_res.file_id.clone(),
                     };
 
-                    let _ = self.routing_table.insert_file(NewFileParams {
+                    if let Err(e) = self.routing_table.insert_file(NewFileParams {
                         parent_ino: wp.parent_ino,
                         name: &wp.filename,
                         size: commit_res.total_bytes,
@@ -1591,26 +1723,22 @@ impl UcloudFsDriver {
                         created_time: 1_700_000_000,
                         location,
                         web_view_link: None,
-                    })?;
+                    }) {
+                        self.finish_overwrite(detached, wp.parent_ino, false);
+                        return Err(e);
+                    }
 
+                    self.finish_overwrite(detached, wp.parent_ino, true);
                     self.sync_engine.record_local_upsert(&account_id, &commit_res.file_id);
                     self.notifier.notify_created(&wp.path);
                     info!(path = %wp.path, total_bytes = commit_res.total_bytes, "Committed single file upload to VFS");
                 } else if let Some(guard) = wp.striped_guard.take() {
-                    if let Some((_old_ino, old_account_id, old_google_file_id)) = wp.overwriting_existing.take() {
-                        let _ = self.routing_table.remove(wp.parent_ino, &wp.filename);
-                        let client_clone = Arc::clone(&self.client);
-                        let token_clone = self
-                            .account_tokens
-                            .get(&old_account_id)
-                            .map(|t| t.clone())
-                            .unwrap_or_default();
-                        tokio::spawn(async move {
-                            let _ = client_clone
-                                .delete_file(&old_account_id, &token_clone, &old_google_file_id)
-                                .await;
-                        });
-                    }
+                    // Detach (not delete) the file being overwritten: the striped upload below can fail,
+                    // in which case the original must survive both in the routing table and on Drive.
+                    let overwriting = wp.overwriting_existing.take();
+                    let detached =
+                        self.detach_overwritten_file(wp.parent_ino, &wp.filename, overwriting);
+
                     let mut account_tokens = HashMap::new();
                     for item in self.account_tokens.iter() {
                         account_tokens.insert(item.key().clone(), item.value().clone());
@@ -1621,14 +1749,23 @@ impl UcloudFsDriver {
                         Arc::clone(&self.routing_table),
                     );
 
-                    let unified_ino = chunker
+                    let unified_ino = match chunker
                         .upload_striped_file(
                             wp.parent_ino,
                             guard,
                             &wp.uploaded_bytes,
                             &account_tokens,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(ino) => ino,
+                        Err(e) => {
+                            self.finish_overwrite(detached, wp.parent_ino, false);
+                            return Err(e);
+                        }
+                    };
+
+                    self.finish_overwrite(detached, wp.parent_ino, true);
 
                     if let Some(node) = self.routing_table.get_inode(unified_ino)
                         && let StorageLocation::StripedManifest {

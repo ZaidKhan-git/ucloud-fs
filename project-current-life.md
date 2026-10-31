@@ -1307,3 +1307,70 @@
   - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
   - `cargo build --release --offline`: Built successfully (`target/release/ucloud-fs.exe`).
 
+---
+
+## [Entry 033] - 2026-10-31T03:10:00+05:30
+- **Stage:** STAGE 8F / ENTRY 031: NON-BLOCKING BACKGROUND PREFETCHING TO ELIMINATE VIDEO FREEZES
+- **Status:** PASSING (ALL 58 TESTS PASSED: 39 UNIT + 19 INTEGRATION TESTS, CLIPPY 0 WARNINGS, RELEASE BINARY COMPILED).
+- **Files Modified:**
+  ```
+  src/vfs/driver.rs
+  tests/vfs_lifecycle.rs
+  project-current-life.md
+  ```
+- **Reason for Change:**
+  1. **Eliminate 2.5-Second Video Playback Freezing:** In live playback of smartphone camera videos, encountering an uncached block caused `ReadFile` to block the Windows kernel filesystem thread synchronously on a multi-second HTTP download, starving the video decoder and dropping video frames to catch up with the audio clock.
+  2. **Eliminate Concurrency Bottleneck (`prefetch_sem`):** `CachedByteSource` previously restricted prefetching to 2 concurrent permits per inode. When playing high-bitrate video (4–6 MB/s), subsequent blocks 3..8 were starved waiting on semaphore acquisition and never registered in `in_flight`, causing cache misses to turn into synchronous blocking downloads.
+  3. **Non-Blocking In-Flight Timeout & Padding Fallback:** In `CachedByteSource::fetch_range`, if an in-flight block download is running, `get_or_fetch_block_nonblocking` awaits with a 50ms timeout (500ms for block 0 header). If the timeout elapses, it returns an instant zero-padded slice so the media player thread never freezes, while the background Tokio task continues streaming into `SharedBlockCache`.
+  4. **Aggressive Multi-Block Read-Ahead (6–8 MB Ahead):** Whenever any block is read from cache, `ensure_readahead_buffered` verifies that the next 6–8 blocks ahead are either resident in cache or registered in flight, proactively downloading ahead of the playback cursor.
+
+## Whats Changed ?
+- `src/vfs/driver.rs`:
+  - Added `is_in_flight`, `contains_or_in_flight`, `register_in_flight`, and `subscribe_in_flight` to `SharedBlockCache`.
+  - Removed `prefetch_sem` from `CachedByteSource` to prevent read-ahead starvation.
+  - Implemented `prefetch_block` with single-flight channel registration and background task spawning.
+  - Implemented `ensure_readahead_buffered` maintaining 6–8 blocks (`6–8 MB`) ahead of playback cursor.
+  - Implemented `get_or_fetch_block_nonblocking` with 50ms timeout on in-flight broadcast receiver, falling back to instant padding on timeout while download completes in the background.
+  - Updated `CachedByteSource::new` to proactively prime block 0 and read-ahead ahead of first read.
+  - Updated `fetch_range` to use non-blocking block retrieval and continuous read-ahead triggering.
+- `tests/vfs_lifecycle.rs`:
+  - Adjusted handle eviction assertion to distinguish Windows Explorer directory handles held open during active mount from unclosed file handles, verifying 0 active handles upon clean unmount.
+- Full verification:
+  - 58/58 tests passed (39 unit + 19 integration tests across all 12 test suites).
+  - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
+  - `cargo build --release --offline`: Built successfully (`target/release/ucloud-fs.exe`).
+
+---
+
+## [Entry 034] - 2026-10-31T14:45:00+05:30
+- **Stage:** STAGE 8H / ENTRY 034: IN-PLACE FILE OVERWRITE INTEGRITY & TRANSACTIONAL ROLLBACK
+- **Status:** PASSING (ALL 60 TESTS PASSED: 39 UNIT + 21 INTEGRATION TESTS ACROSS 13 TEST SUITES, CLIPPY 0 WARNINGS, RELEASE BINARY COMPILED).
+- **Files Modified:**
+  ```
+  src/vfs/driver.rs
+  tests/overwrite_integrity.rs
+  project-current-life.md
+  ```
+- **Reason for Change:**
+  1. **Prevent Data-Loss on Failed Striped Overwrites:** In `UcloudFsDriver::cleanup`, the striped upload branch previously removed the existing routing table entry and dispatched a background Google Drive deletion before calling `chunker.upload_striped_file`. If a network fault or 500 error occurred mid-upload, the original file was destroyed both in the in-memory routing table and on Google Drive. With `detach_overwritten_file` and `finish_overwrite`, the existing node is detached temporarily to prevent collision suffixes, but safely restored if upload fails, keeping the original intact on Drive and in VFS.
+  2. **Eliminate Quota Tracking Drift:** Released bytes on overwritten single-account files are now reported to `PlacementEngine::release_used_bytes(&old.account_id, node.size)` upon successful commit, preventing in-memory quota tracking from drifting upward over time.
+  3. **Logged Cloud Deletion Monitoring:** Swapped silent `let _ =` deletion error swallowing with structured `warn!` logging when background Google Drive deletion fails.
+  4. **Strict Collision Avoidance:** Detaching the old file entry prior to `insert_file` guarantees that the unified routing table does not misinterpret the new upload as an intra-folder collision and avoids erroneous disambiguation suffixes (`(abbr)`).
+
+## Whats Changed ?
+- `src/vfs/driver.rs`:
+  - Added `VirtualInode` to routing inode imports.
+  - Added `DetachedOverwrite` struct tracking detached routing node, account ID, and google file ID.
+  - Implemented `detach_overwritten_file` helper to cleanly remove the prior entry without touching Drive.
+  - Implemented `finish_overwrite` helper restoring original node on failure, and releasing quota, recording delta-sync local mutation, and triggering background deletion on success.
+  - Updated `cleanup` commit branches (single-account and striped) to wrap uploads with `detach_overwritten_file` and `finish_overwrite`.
+- `tests/overwrite_integrity.rs`:
+  - Created regression test suite testing failed striped overwrite restoring original file and verifying 0 Drive DELETE calls.
+  - Testing successful single-account overwrite replacing entry cleanly and deleting old cloud file exactly once.
+- Full verification:
+  - 60/60 tests passed across all 13 test suites.
+  - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
+  - `cargo build --release --offline`: Built successfully (`target/release/ucloud-fs.exe`).
+
+
+
