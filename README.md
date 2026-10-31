@@ -27,13 +27,21 @@
 ## 🚀 Quick Start Guide
 
 ### 1. Authenticate an Account
-Link your Google Drive account using OAuth 2.0 PKCE loopback:
+
+To use your personal Google Cloud Console OAuth credentials, set the environment variables in PowerShell:
+```powershell
+$env:UCLOUD_CLIENT_ID = "<YOUR_CLIENT_ID>"
+$env:UCLOUD_CLIENT_SECRET = "<YOUR_CLIENT_SECRET>"
+```
+*(Or pass them directly via `--client-id` and `--client-secret`).*
+
+Then initiate authentication:
 ```powershell
 ucloud-fs.exe login
 ```
-*(Your default web browser will open to grant read/write access to Google Drive).*
+*(Your default web browser will open to Google's **Account Chooser** screen. You can select any of your authorized Google accounts or add a new account to link).*
 
-To add additional accounts to the unified storage pool:
+To link additional accounts to the unified storage pool:
 ```powershell
 ucloud-fs.exe add-account
 ```

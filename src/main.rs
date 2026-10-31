@@ -307,6 +307,12 @@ async fn cmd_login(
     println!(
         "================================================================================\n"
     );
+    println!("Instructions for Google OAuth credentials:");
+    println!("  To use your personal Google Client ID and Secret, set environment variables:");
+    println!("    $env:UCLOUD_CLIENT_ID = \"<your-client-id>\"");
+    println!("    $env:UCLOUD_CLIENT_SECRET = \"<your-client-secret>\"");
+    println!("  Or pass them via CLI flags: ucloud-fs login --client-id <ID> --client-secret <SECRET>");
+    println!("  Or save them permanently:   ucloud-fs set-credentials\n");
 
     let (saved_id, saved_secret) = load_saved_client_credentials()
         .map(|(a, b)| (Some(a), Some(b)))
@@ -323,6 +329,8 @@ async fn cmd_login(
                 DEFAULT_CLIENT_ID.to_string()
             } else {
                 use std::io::Write;
+                println!("Hint: Set UCLOUD_CLIENT_ID and UCLOUD_CLIENT_SECRET environment variables");
+                println!("      or pass --client-id <ID> --client-secret <SECRET>.");
                 print!("Enter Google OAuth Client ID: ");
                 std::io::stdout().flush().ok();
                 let mut input = String::new();
@@ -349,6 +357,8 @@ async fn cmd_login(
                 DEFAULT_CLIENT_SECRET.to_string()
             } else {
                 use std::io::Write;
+                println!("Hint: Set UCLOUD_CLIENT_ID and UCLOUD_CLIENT_SECRET environment variables");
+                println!("      or pass --client-id <ID> --client-secret <SECRET>.");
                 print!("Enter Google OAuth Client Secret: ");
                 std::io::stdout().flush().ok();
                 let mut input = String::new();
@@ -390,8 +400,10 @@ async fn cmd_login(
     let pkce = generate_pkce();
     let csrf_state = generate_csrf_state();
 
+    // prompt=select_account%20consent guarantees Google displays the account picker,
+    // allowing the user to explicitly choose their test account rather than defaulting to the browser's primary account.
     let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive&access_type=offline&prompt=select_account%20consent&state={}&code_challenge={}&code_challenge_method=S256",
         DEFAULT_GOOGLE_AUTH_ENDPOINT,
         client_id,
         redirect_uri,
