@@ -3,30 +3,34 @@
 **Pure-Rust Unified Cloud Virtual Filesystem Daemon** for Windows 11 / 10.
 
 `ucloud-fs` mounts multiple Google Drive accounts into a unified, high-performance local Windows filesystem (`X:` or `Y:`) backed by [WinFsp](https://winfsp.dev/). It behaves like a native physical drive in Windows Explorer, Command Prompt, and PowerShell with zero persistent disk caching and instant progressive video/media streaming.
-
+## Build with Gemini 3.8 Flash
 ---
 
-## 🌟 Key Features
+## Key Features
 
 - **Zero Persistent Disk Footprint**: Reads and writes stream directly to/from Google Drive. No massive temporary cache files filling your local SSD.
 - **Sub-Second Progressive Streaming**: Built with a lock-free direct page cache (`SharedBlockCache`) using 512 KB blocks and paced background read-ahead. Media players (e.g. VLC, Windows Media Player) start playing instantly without freezing or buffering pauses.
 - **Multi-Account Storage Pooling & Affinity**: Combines storage across multiple Google accounts. Files inherit parent folder account affinity, while files exceeding single-account capacity are transparently striped across accounts.
-- **Collision Disambiguation**: When different accounts contain folders or files with the same name, `ucloud-fs` disambiguates them cleanly in Windows Explorer (e.g. `Projects (mohdzaidk035)` vs `Projects (ucloudfs)`).
+- **Collision Disambiguation**: When different accounts contain folders or files with the same name, `ucloud-fs` disambiguates them cleanly in Windows Explorer.
 - **3-Pass Topological Delta Sync**: Background engine monitors remote Google Drive changes (`changes.list`) every 10 seconds. Out-of-order hierarchies and remote deletions are reconciled topologically without parent loss, duplicate mirroring, or resurrection loops.
 - **Zeroized Encrypted Vault**: Account OAuth credentials and refresh tokens are protected at rest using `Argon2id` key derivation and authenticated `ChaCha20-Poly1305` encryption, with memory zeroization on drop.
 
 ---
 
-## 📋 Prerequisites
+## Prerequisites
 
 1. **Windows 10 / 11** (64-bit `x86_64`)
 2. **WinFsp**: Install the latest [WinFsp release](https://github.com/winfsp/winfsp/releases) (v2.0 or higher) for kernel-mode filesystem redirection.
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### 1. Authenticate an Account
+Move inside executable folder:
+```powershell
+cd ucloud-fs
+```
 Link your Google Drive account using OAuth 2.0 PKCE loopback:
 ```powershell
 ucloud-fs.exe login
@@ -59,7 +63,7 @@ Open Windows Explorer to browse `X:` as a standard local drive!
 
 ---
 
-## 🛠️ CLI Command Reference
+## CLI Command Reference
 
 | Command | Arguments | Description |
 |---|---|---|
@@ -75,7 +79,7 @@ Open Windows Explorer to browse `X:` as a standard local drive!
 
 ---
 
-## 🔑 Using Your Personal Google OAuth Credentials
+## Using Your Personal Google OAuth Credentials
 
 > [!IMPORTANT]
 > **Why set up your own Google Cloud project?**
@@ -159,7 +163,7 @@ ucloud-fs.exe set-credentials --reset
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ```
                       +-----------------------------+
@@ -209,7 +213,7 @@ ucloud-fs.exe set-credentials --reset
 
 ---
 
-## 🧪 Running Tests & Building From Source
+##  Running Tests & Building From Source
 
 Prerequisites for building:
 - Rust toolchain (`x86_64-pc-windows-gnu`)
