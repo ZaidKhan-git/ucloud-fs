@@ -2515,3 +2515,161 @@ async fn test_adversarial_out_of_order_hydration_with_cross_account_collisions()
         "/ExtBoundary1/ExtChild must resolve"
     );
 }
+
+#[tokio::test]
+async fn test_web_ui_upload_in_subfolder_does_not_multiply_root_folders_and_deletion_persists() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/about"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "storageQuota": {
+                "limit": "104857600",
+                "usage": "20000000"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let (_client, routing_table, _placement, _session, _notifier, sync_engine) =
+        setup_test_env(&server).await;
+
+    let acc = "ucloudfs@gmail.com";
+    sync_engine.set_start_page_token(acc, "token_initial".to_string());
+
+    // 1. Initially create "WorkDocs" folder
+    let work_fid = "google_folder_workdocs";
+    let work_ino = routing_table
+        .insert_or_merge_directory(
+            InMemoryRoutingTable::ROOT_INO,
+            "WorkDocs",
+            Some(acc),
+            Some(work_fid),
+        )
+        .expect("Failed to insert WorkDocs");
+
+    assert_eq!(routing_table.count(), 2); // ROOT + WorkDocs
+
+    // 2. Simulate Web UI upload: Google returns changes containing both WorkDocs touch and a new file inside WorkDocs
+    let changes_web_upload = GoogleChangesList {
+        changes: vec![
+            GoogleChangeItem {
+                file_id: work_fid.to_string(),
+                removed: Some(false),
+                file: Some(GoogleFileMetadata {
+                    id: work_fid.to_string(),
+                    name: "WorkDocs".to_string(),
+                    mime_type: "application/vnd.google-apps.folder".to_string(),
+                    size: None,
+                    trashed: Some(false),
+                    parents: Some(vec!["root".to_string()]),
+                    modified_time: None,
+                    app_properties: None,
+                }),
+            },
+            GoogleChangeItem {
+                file_id: "google_file_budget_xlsx".to_string(),
+                removed: Some(false),
+                file: Some(GoogleFileMetadata {
+                    id: "google_file_budget_xlsx".to_string(),
+                    name: "budget.xlsx".to_string(),
+                    mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+                    size: Some("45000".to_string()),
+                    trashed: Some(false),
+                    parents: Some(vec![work_fid.to_string()]), // Inside WorkDocs!
+                    modified_time: None,
+                    app_properties: None,
+                }),
+            },
+        ],
+        next_page_token: None,
+        new_start_page_token: Some("token_after_upload".to_string()),
+    };
+
+    let stats = sync_engine
+        .apply_changes(acc, &changes_web_upload, "mock_token")
+        .await
+        .expect("Apply web upload failed");
+
+    assert_eq!(stats.updated, 1); // WorkDocs updated
+    assert_eq!(stats.created, 1); // budget.xlsx created
+
+    // Assert: WorkDocs did NOT multiply in ROOT_INO!
+    let root_children = routing_table.readdir(InMemoryRoutingTable::ROOT_INO).unwrap();
+    assert_eq!(
+        root_children.len(),
+        1,
+        "Root directory must contain EXACTLY ONE folder, not duplicated"
+    );
+    assert_eq!(root_children[0].name, "WorkDocs");
+    assert_eq!(root_children[0].ino, work_ino);
+
+    // Assert: budget.xlsx is INSIDE WorkDocs, NOT in ROOT_INO
+    let work_children = routing_table.readdir(work_ino).unwrap();
+    assert_eq!(work_children.len(), 1);
+    assert_eq!(work_children[0].name, "budget.xlsx");
+    assert_eq!(
+        routing_table.resolve_path("/WorkDocs/budget.xlsx").unwrap(),
+        work_children[0].ino
+    );
+
+    // 3. Repeat delta sync with another event: ensure no duplicates spawn
+    let changes_repeat = GoogleChangesList {
+        changes: vec![GoogleChangeItem {
+            file_id: work_fid.to_string(),
+            removed: Some(false),
+            file: Some(GoogleFileMetadata {
+                id: work_fid.to_string(),
+                name: "WorkDocs".to_string(),
+                mime_type: "application/vnd.google-apps.folder".to_string(),
+                size: None,
+                trashed: Some(false),
+                parents: Some(vec!["root".to_string()]),
+                modified_time: None,
+                app_properties: None,
+            }),
+        }],
+        next_page_token: None,
+        new_start_page_token: Some("token_after_repeat".to_string()),
+    };
+
+    let stats_repeat = sync_engine
+        .apply_changes(acc, &changes_repeat, "mock_token")
+        .await
+        .expect("Repeat sync failed");
+    assert_eq!(stats_repeat.updated, 1);
+
+    let root_after_repeat = routing_table.readdir(InMemoryRoutingTable::ROOT_INO).unwrap();
+    assert_eq!(
+        root_after_repeat.len(),
+        1,
+        "Root directory must still have EXACTLY ONE folder after repeated sync"
+    );
+    assert_eq!(root_after_repeat[0].name, "WorkDocs");
+
+    // 4. Delete the folder locally and verify it does NOT bounce back
+    let _ = routing_table.remove(work_ino, "budget.xlsx");
+    let _ = routing_table.remove(InMemoryRoutingTable::ROOT_INO, "WorkDocs");
+    assert_eq!(routing_table.readdir(InMemoryRoutingTable::ROOT_INO).unwrap().len(), 0);
+
+    // Now simulate subsequent poll with empty changes since token was advanced:
+    let changes_empty = GoogleChangesList {
+        changes: vec![],
+        next_page_token: None,
+        new_start_page_token: Some("token_final".to_string()),
+    };
+
+    let stats_empty = sync_engine
+        .apply_changes(acc, &changes_empty, "mock_token")
+        .await
+        .expect("Empty sync failed");
+    assert_eq!(stats_empty.created, 0);
+    assert_eq!(stats_empty.updated, 0);
+
+    // Assert: ROOT remains completely empty, deleted folder does NOT resurrect
+    assert_eq!(
+        routing_table.readdir(InMemoryRoutingTable::ROOT_INO).unwrap().len(),
+        0,
+        "Deleted folder must NOT resurrect on subsequent delta poll"
+    );
+}

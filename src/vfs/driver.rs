@@ -1504,12 +1504,23 @@ impl UcloudFsDriver {
                 let tokens_map: HashMap<String, String> = self.account_tokens.iter().map(|kv| (kv.key().clone(), kv.value().clone())).collect();
                 self.rt_handle.spawn(async move {
                     for (account_id, file_id) in cloud_deletions {
-                        if let Some(token) = tokens_map.get(&account_id) {
+                        let token_opt = tokens_map
+                            .get(&account_id)
+                            .or_else(|| {
+                                tokens_map
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(&account_id))
+                                    .map(|(_, v)| v)
+                            });
+
+                        if let Some(token) = token_opt {
                             if let Err(e) = client.delete_file(&account_id, token, &file_id).await {
                                 warn!(account = %account_id, file_id = %file_id, error = %e, "Failed to delete file on Google Drive");
                             } else {
                                 info!(account = %account_id, file_id = %file_id, "Successfully deleted remote file on Google Drive");
                             }
+                        } else {
+                            warn!(account = %account_id, file_id = %file_id, "No OAuth token registered for account; remote cloud deletion skipped");
                         }
                     }
                 });

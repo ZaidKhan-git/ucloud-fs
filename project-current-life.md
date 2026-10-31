@@ -766,7 +766,7 @@
   - In [src/vfs/driver_winfsp.rs](file:///Z:/ucloud-fs/src/vfs/driver_winfsp.rs), enabled bit 16 (`1 << 16`) in `volume_params.flags`. Under WinFsp specification, this tells the kernel FSD that user-mode `FileContext` represents an independent file descriptor (`UserContext2`) allocated per `Create`/`Open` and freed on `Close`, preventing multi-handle use-after-free and memory corruption faults.
 - Per-Account OAuth Credential Persistence & Automated Token Refresh:
   - In [src/security/vault.rs](file:///Z:/ucloud-fs/src/security/vault.rs), added `client_id: Option<String>` and `client_secret: Option<String>` with `#[serde(default)]` and redacted debug logging.
-  - In [src/main.rs](file:///Z:/ucloud-fs/src/main.rs), implemented `resolve_client_credentials(&AccountCredentials) -> (String, String)` that maps credentials to their respective Google Cloud project secrets (`646117914528...` for Account #1 and `512567134532...` for Account #2).
+  - In [src/main.rs](file:///Z:/ucloud-fs/src/main.rs), implemented `resolve_client_credentials(&AccountCredentials) -> (String, String)` that maps credentials to their respective Google Cloud project secrets (`<CLIENT_ID_1>...` for Account #1 and `<CLIENT_ID_2>...` for Account #2).
   - Updated `cmd_login`, `cmd_status`, `cmd_test_live`, and `cmd_mount` to refresh expired tokens seamlessly using each account's matching credentials and automatically update `vault.enc`.
 - Live Verification:
   - Executed `ucloud-fs status`: refreshed both accounts and confirmed live quotas:

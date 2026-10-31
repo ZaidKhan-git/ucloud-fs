@@ -198,8 +198,12 @@ impl DeltaSyncEngine {
     ) -> Result<SyncStats, VfsError> {
         let mut stats = SyncStats::default();
 
+        // 1. Separate changes into deletions, folders, and files
+        let mut deletions = Vec::new();
+        let mut folders = Vec::new();
+        let mut files = Vec::new();
+
         for change in &changes_list.changes {
-            let file_id = &change.file_id;
             let is_removed = change.removed.unwrap_or(false)
                 || change
                     .file
@@ -208,68 +212,98 @@ impl DeltaSyncEngine {
                     .unwrap_or(false);
 
             if is_removed {
-                // 1. Remote Deletion
-                if let Some(ino) = self.routing_table.lookup_by_cloud_id(account_id, file_id) {
-                    if self.is_self_echo(account_id, file_id, LocalMutationKind::Delete) {
-                        debug!(
-                            account = %account_id,
-                            file_id,
-                            "Suppressed self-echo deletion notification"
-                        );
-                        continue;
-                    }
-
-                    // Check if file is currently open; if so, flag is_unlinked
-                    if let Some(flag) = self.open_handles.get(&ino) {
-                        flag.store(true, Ordering::SeqCst);
-                        warn!(
-                            ino,
-                            file_id,
-                            "Remote deletion occurred while file handle is open locally"
-                        );
-                    }
-
-                    if let Some(node) = self.routing_table.get_inode(ino) {
-                        let is_striped = matches!(node.location, StorageLocation::StripedManifest { .. });
-                        let _ = self.routing_table.remove(node.parent_ino, &node.name);
-                        let del_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
-                            if parent_path == "/" || parent_path.is_empty() {
-                                format!("/{}", node.name)
-                            } else {
-                                format!("{}/{}", parent_path.trim_end_matches('/'), node.name)
-                            }
-                        } else {
-                            format!("/{}", node.name)
-                        };
-                        self.notifier.notify_deleted(&del_path);
-                        stats.deleted += 1;
-
-                        if is_striped {
-                            let warning_name = format!("{}.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt", node.name);
-                            if self.routing_table.remove(node.parent_ino, &warning_name).is_ok() {
-                                let warn_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
-                                    if parent_path == "/" || parent_path.is_empty() {
-                                        format!("/{}", warning_name)
-                                    } else {
-                                        format!("{}/{}", parent_path.trim_end_matches('/'), warning_name)
-                                    }
-                                } else {
-                                    format!("/{}", warning_name)
-                                };
-                                self.notifier.notify_deleted(&warn_path);
-                            }
-                        }
-
-                        info!(
-                            account = %account_id,
-                            name = %node.name,
-                            ino,
-                            "Reconciled remote cloud deletion into local VFS"
-                        );
-                    }
-                }
+                deletions.push(change);
             } else if let Some(file) = &change.file {
-                // 2. Remote Addition or Update
+                let is_folder = file.mime_type == "application/vnd.google-apps.folder";
+                if is_folder {
+                    folders.push(change);
+                } else {
+                    files.push(change);
+                }
+            }
+        }
+
+        // --- PASS 1: Remote Deletions ---
+        for change in deletions {
+            let file_id = &change.file_id;
+            if let Some(ino) = self.routing_table.lookup_by_cloud_id(account_id, file_id) {
+                if self.is_self_echo(account_id, file_id, LocalMutationKind::Delete) {
+                    debug!(
+                        account = %account_id,
+                        file_id,
+                        "Suppressed self-echo deletion notification"
+                    );
+                    continue;
+                }
+
+                // Check if file is currently open; if so, flag is_unlinked
+                if let Some(flag) = self.open_handles.get(&ino) {
+                    flag.store(true, Ordering::SeqCst);
+                    warn!(
+                        ino,
+                        file_id,
+                        "Remote deletion occurred while file handle is open locally"
+                    );
+                }
+
+                if let Some(node) = self.routing_table.get_inode(ino) {
+                    let is_striped = matches!(node.location, StorageLocation::StripedManifest { .. });
+                    let _ = self.routing_table.remove(node.parent_ino, &node.name);
+                    let del_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
+                        if parent_path == "/" || parent_path.is_empty() {
+                            format!("/{}", node.name)
+                        } else {
+                            format!("{}/{}", parent_path.trim_end_matches('/'), node.name)
+                        }
+                    } else {
+                        format!("/{}", node.name)
+                    };
+                    self.notifier.notify_deleted(&del_path);
+                    stats.deleted += 1;
+
+                    if is_striped {
+                        let warning_name = format!("{}.CANNOT_ACCESS_WITHOUT_DOWNLOADING.txt", node.name);
+                        if self.routing_table.remove(node.parent_ino, &warning_name).is_ok() {
+                            let warn_path = if let Some(parent_path) = self.routing_table.get_path_for_inode(node.parent_ino) {
+                                if parent_path == "/" || parent_path.is_empty() {
+                                    format!("/{}", warning_name)
+                                } else {
+                                    format!("{}/{}", parent_path.trim_end_matches('/'), warning_name)
+                                }
+                            } else {
+                                format!("/{}", warning_name)
+                            };
+                            self.notifier.notify_deleted(&warn_path);
+                        }
+                    }
+
+                    info!(
+                        account = %account_id,
+                        name = %node.name,
+                        ino,
+                        "Reconciled remote cloud deletion into local VFS"
+                    );
+                }
+            }
+        }
+
+        // --- PASS 2: Folder Additions and Updates (Topological Resolution) ---
+        let mut pending_folders = folders;
+        let max_passes = 16;
+        for _ in 0..max_passes {
+            if pending_folders.is_empty() {
+                break;
+            }
+            let mut next_pending = Vec::new();
+            let prev_count = pending_folders.len();
+
+            for change in pending_folders {
+                let file_id = &change.file_id;
+                let file = match &change.file {
+                    Some(f) => f,
+                    None => continue,
+                };
+
                 if self.is_self_echo(account_id, file_id, LocalMutationKind::Upsert) {
                     debug!(
                         account = %account_id,
@@ -284,104 +318,205 @@ impl DeltaSyncEngine {
                     self.routing_table.get_inode(ino).map(|n| n.parent_ino)
                 });
 
-                let parent_ino = self.resolve_parent_ino(
-                    account_id,
-                    file.parents.as_deref(),
-                    existing_parent_ino,
-                );
+                let parent_google_id = file.parents.as_ref().and_then(|p| p.first()).map(|s| s.as_str());
+                let parent_ino = match parent_google_id {
+                    None => Some(existing_parent_ino.unwrap_or(InMemoryRoutingTable::ROOT_INO)),
+                    Some("root") => Some(InMemoryRoutingTable::ROOT_INO),
+                    Some(gid) => self
+                        .routing_table
+                        .lookup_by_cloud_id(account_id, gid)
+                        .or(existing_parent_ino),
+                };
 
-                let is_folder = file.mime_type == "application/vnd.google-apps.folder";
+                match parent_ino {
+                    Some(p_ino) => {
+                        if let Some(existing_ino) = existing_ino {
+                            let effective_display_name = self.routing_table.update_existing_directory(
+                                existing_ino,
+                                p_ino,
+                                &file.name,
+                                0,
+                            );
+                            let display_name = effective_display_name.as_deref().unwrap_or(&file.name);
+                            let notify_path = Self::format_notify_path(
+                                &self.routing_table,
+                                p_ino,
+                                display_name,
+                            );
+                            self.notifier.notify_updated(&notify_path);
+                            stats.updated += 1;
+                        } else {
+                            match self.routing_table.insert_or_merge_directory(
+                                p_ino,
+                                &file.name,
+                                Some(account_id),
+                                Some(file_id),
+                            ) {
+                                Ok(new_ino) => {
+                                    let display_name = self
+                                        .routing_table
+                                        .get_inode(new_ino)
+                                        .map(|n| n.name)
+                                        .unwrap_or_else(|| file.name.clone());
+                                    let full_path = Self::format_notify_path(
+                                        &self.routing_table,
+                                        p_ino,
+                                        &display_name,
+                                    );
+                                    self.notifier.notify_created(&full_path);
+                                    stats.created += 1;
+                                    info!(
+                                        account = %account_id,
+                                        name = %file.name,
+                                        file_id,
+                                        "Reconciled new remote cloud folder into local VFS"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        account = %account_id,
+                                        name = %file.name,
+                                        error = %e,
+                                        "Failed to insert remote folder into VFS"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        next_pending.push(change);
+                    }
+                }
+            }
 
-                if let Some(existing_ino) = existing_ino {
-                    let effective_display_name = if is_folder {
-                        self.routing_table.update_existing_directory(
-                            existing_ino,
-                            parent_ino,
-                            &file.name,
-                            0,
-                        )
-                    } else {
-                        let existing_size = self
-                            .routing_table
-                            .get_inode(existing_ino)
-                            .map(|n| n.size)
-                            .unwrap_or(0);
-                        let size = file
-                            .size
-                            .as_ref()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(existing_size);
-                        self.routing_table.update_existing_file(
-                            existing_ino,
-                            parent_ino,
-                            &file.name,
-                            size,
-                            0,
-                        )
+            if next_pending.len() >= prev_count {
+                // Fallback remaining unplaced folders to ROOT_INO
+                for change in next_pending {
+                    let file_id = &change.file_id;
+                    let file = match &change.file {
+                        Some(f) => f,
+                        None => continue,
                     };
+                    if self.is_self_echo(account_id, file_id, LocalMutationKind::Upsert) {
+                        continue;
+                    }
+                    let existing_ino = self.routing_table.lookup_by_cloud_id(account_id, file_id);
+                    let p_ino = existing_ino.and_then(|ino| {
+                        self.routing_table.get_inode(ino).map(|n| n.parent_ino)
+                    }).unwrap_or(InMemoryRoutingTable::ROOT_INO);
 
-                    let display_name = effective_display_name.as_deref().unwrap_or(&file.name);
-                    let notify_path = Self::format_notify_path(
-                        &self.routing_table,
-                        parent_ino,
-                        display_name,
-                    );
-                    self.notifier.notify_updated(&notify_path);
-                    stats.updated += 1;
-                    debug!(
-                        ino = existing_ino,
-                        name = %display_name,
-                        "Reconciled remote cloud update"
-                    );
-                } else {
-                    // New remote file or folder created directly on web drive
-                    if is_folder {
-                        let new_ino = self.routing_table.insert_or_merge_directory(
-                            parent_ino,
+                    if let Some(existing_ino) = existing_ino {
+                        let effective_display_name = self.routing_table.update_existing_directory(
+                            existing_ino,
+                            p_ino,
+                            &file.name,
+                            0,
+                        );
+                        let display_name = effective_display_name.as_deref().unwrap_or(&file.name);
+                        let notify_path = Self::format_notify_path(
+                            &self.routing_table,
+                            p_ino,
+                            display_name,
+                        );
+                        self.notifier.notify_updated(&notify_path);
+                        stats.updated += 1;
+                    } else {
+                        let _ = self.routing_table.insert_or_merge_directory(
+                            p_ino,
                             &file.name,
                             Some(account_id),
                             Some(file_id),
-                        )?;
-                        let display_name = self
-                            .routing_table
-                            .get_inode(new_ino)
-                            .map(|n| n.name)
-                            .unwrap_or_else(|| file.name.clone());
-                        let full_path = Self::format_notify_path(
-                            &self.routing_table,
-                            parent_ino,
-                            &display_name,
                         );
-                        self.notifier.notify_created(&full_path);
                         stats.created += 1;
-                        info!(
-                            account = %account_id,
-                            name = %file.name,
-                            file_id,
-                            "Reconciled new remote cloud folder into local VFS"
-                        );
-                    } else {
-                        let size = file
-                            .size
-                            .as_ref()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        let location = StorageLocation::SingleAccount {
-                            account_id: account_id.to_string(),
-                            google_file_id: file.id.clone(),
-                        };
+                    }
+                }
+                break;
+            }
+            pending_folders = next_pending;
+        }
 
-                        let new_ino = self.routing_table.insert_file(NewFileParams {
-                            parent_ino,
-                            name: &file.name,
-                            size,
-                            mime_type: &file.mime_type,
-                            modified_time: 0,
-                            created_time: 0,
-                            location,
-                            web_view_link: None,
-                        })?;
+        // --- PASS 3: File Additions and Updates ---
+        for change in files {
+            let file_id = &change.file_id;
+            let file = match &change.file {
+                Some(f) => f,
+                None => continue,
+            };
 
+            if self.is_self_echo(account_id, file_id, LocalMutationKind::Upsert) {
+                debug!(
+                    account = %account_id,
+                    file_id,
+                    "Suppressed self-echo update notification"
+                );
+                continue;
+            }
+
+            let existing_ino = self.routing_table.lookup_by_cloud_id(account_id, file_id);
+            let existing_parent_ino = existing_ino.and_then(|ino| {
+                self.routing_table.get_inode(ino).map(|n| n.parent_ino)
+            });
+
+            let parent_ino = self.resolve_parent_ino(
+                account_id,
+                file.parents.as_deref(),
+                existing_parent_ino,
+            );
+
+            if let Some(existing_ino) = existing_ino {
+                let existing_size = self
+                    .routing_table
+                    .get_inode(existing_ino)
+                    .map(|n| n.size)
+                    .unwrap_or(0);
+                let size = file
+                    .size
+                    .as_ref()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(existing_size);
+                let effective_display_name = self.routing_table.update_existing_file(
+                    existing_ino,
+                    parent_ino,
+                    &file.name,
+                    size,
+                    0,
+                );
+
+                let display_name = effective_display_name.as_deref().unwrap_or(&file.name);
+                let notify_path = Self::format_notify_path(
+                    &self.routing_table,
+                    parent_ino,
+                    display_name,
+                );
+                self.notifier.notify_updated(&notify_path);
+                stats.updated += 1;
+                debug!(
+                    ino = existing_ino,
+                    name = %display_name,
+                    "Reconciled remote cloud update"
+                );
+            } else {
+                let size = file
+                    .size
+                    .as_ref()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let location = StorageLocation::SingleAccount {
+                    account_id: account_id.to_string(),
+                    google_file_id: file.id.clone(),
+                };
+
+                match self.routing_table.insert_file(NewFileParams {
+                    parent_ino,
+                    name: &file.name,
+                    size,
+                    mime_type: &file.mime_type,
+                    modified_time: 0,
+                    created_time: 0,
+                    location,
+                    web_view_link: None,
+                }) {
+                    Ok(new_ino) => {
                         let display_name = self
                             .routing_table
                             .get_inode(new_ino)
@@ -398,6 +533,14 @@ impl DeltaSyncEngine {
                             account = %account_id,
                             name = %file.name,
                             "Reconciled new remote cloud file into local VFS"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            account = %account_id,
+                            name = %file.name,
+                            error = %e,
+                            "Failed to insert new remote file into VFS"
                         );
                     }
                 }
@@ -445,7 +588,15 @@ impl DeltaSyncEngine {
             .list_changes(account_id, access_token, &page_token)
             .await?;
 
-        self.apply_changes(account_id, &changes, access_token).await
+        let res = self.apply_changes(account_id, &changes, access_token).await;
+
+        if let Some(tok) = &changes.new_start_page_token {
+            self.set_start_page_token(account_id, tok.clone());
+        } else if let Some(tok) = &changes.next_page_token {
+            self.set_start_page_token(account_id, tok.clone());
+        }
+
+        res
     }
 
     /// Spawns the background delta polling loop across accounts.

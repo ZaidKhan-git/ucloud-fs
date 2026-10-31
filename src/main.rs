@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use bytes::Bytes;
@@ -33,19 +34,90 @@ use ucloud_fs::vfs::driver_winfsp::{WinFspMountGuard, WinFspMountOptions};
 use ucloud_fs::vfs::notify::{ShellNotifier, WindowsShellNotifier};
 use ucloud_fs::vfs::prompt::AutoAcceptPrompter;
 
+pub const DEFAULT_CLIENT_ID: &str = "";
+pub const DEFAULT_CLIENT_SECRET: &str = "";
+
 const VAULT_FILE: &str = "vault.enc";
+const CLIENT_CREDENTIALS_FILE: &str = "client_credentials.json";
 const DEFAULT_PASSPHRASE: &str = "ucloud-fs-secure-vault-passphrase";
 
 fn get_master_passphrase() -> String {
     std::env::var("UCLOUD_PASSPHRASE").unwrap_or_else(|_| DEFAULT_PASSPHRASE.to_string())
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct SavedClientConfig {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+}
+
+fn load_saved_client_credentials() -> Option<(String, String)> {
+    // 1. Check primary client_credentials.json
+    if let Ok(content) = std::fs::read_to_string(CLIENT_CREDENTIALS_FILE)
+        && let Ok(cfg) = serde_json::from_str::<SavedClientConfig>(&content)
+        && let (Some(id), Some(sec)) = (cfg.client_id, cfg.client_secret)
+    {
+        let (tid, tsec) = (id.trim().to_string(), sec.trim().to_string());
+        if !tid.is_empty() && !tsec.is_empty() {
+            return Some((tid, tsec));
+        }
+    }
+
+    // 2. Check credentials.json or client_secret*.json (standard Google Cloud Console downloads)
+    let candidate_files = ["credentials.json", "client_secret.json"];
+    for fname in candidate_files {
+        if let Ok(content) = std::fs::read_to_string(fname)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            let obj = val.get("installed")
+                .or_else(|| val.get("web"))
+                .unwrap_or(&val);
+            if let (Some(id), Some(sec)) = (
+                obj.get("client_id").and_then(|v| v.as_str()),
+                obj.get("client_secret").and_then(|v| v.as_str()),
+            ) {
+                let (tid, tsec) = (id.trim().to_string(), sec.trim().to_string());
+                if !tid.is_empty() && !tsec.is_empty() {
+                    return Some((tid, tsec));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn save_saved_client_credentials(client_id: &str, client_secret: &str) -> Result<(), VfsError> {
+    let cfg = SavedClientConfig {
+        client_id: Some(client_id.trim().to_string()),
+        client_secret: Some(client_secret.trim().to_string()),
+    };
+    let json = serde_json::to_string_pretty(&cfg).map_err(|e| {
+        VfsError::InternalFault(format!("Failed to serialize client credentials: {e}"))
+    })?;
+    std::fs::write(CLIENT_CREDENTIALS_FILE, json).map_err(|e| {
+        VfsError::InternalFault(format!("Failed to write {CLIENT_CREDENTIALS_FILE}: {e}"))
+    })?;
+    Ok(())
+}
+
+fn clear_saved_client_credentials() -> Result<(), VfsError> {
+    if std::path::Path::new(CLIENT_CREDENTIALS_FILE).exists() {
+        std::fs::remove_file(CLIENT_CREDENTIALS_FILE).map_err(|e| {
+            VfsError::InternalFault(format!("Failed to remove {CLIENT_CREDENTIALS_FILE}: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn resolve_client_credentials(cred: &AccountCredentials) -> Result<(String, String), VfsError> {
     if let (Some(id), Some(secret)) = (&cred.client_id, &cred.client_secret)
-        && !id.is_empty()
-        && !secret.is_empty()
+        && !id.trim().is_empty()
+        && !secret.trim().is_empty()
     {
-        return Ok((id.clone(), secret.clone()));
+        return Ok((id.trim().to_string(), secret.trim().to_string()));
     }
 
     let env_id = std::env::var("UCLOUD_CLIENT_ID")
@@ -55,13 +127,25 @@ fn resolve_client_credentials(cred: &AccountCredentials) -> Result<(String, Stri
         .or_else(|_| std::env::var("GOOGLE_CLIENT_SECRET"))
         .ok();
 
-    match (env_id, env_secret) {
-        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Ok((id, secret)),
-        _ => Err(VfsError::PermissionDenied(format!(
-            "Missing OAuth Client ID or Client Secret for account '{}'. Set UCLOUD_CLIENT_ID and UCLOUD_CLIENT_SECRET environment variables or re-authenticate with 'ucloud-fs login --client-id <ID> --client-secret <SECRET>'.",
-            cred.account_id
-        ))),
+    if let (Some(id), Some(secret)) = (env_id, env_secret)
+        && !id.trim().is_empty()
+        && !secret.trim().is_empty()
+    {
+        return Ok((id.trim().to_string(), secret.trim().to_string()));
     }
+
+    if let Some((saved_id, saved_secret)) = load_saved_client_credentials() {
+        return Ok((saved_id, saved_secret));
+    }
+
+    if !DEFAULT_CLIENT_ID.is_empty() && !DEFAULT_CLIENT_SECRET.is_empty() {
+        return Ok((DEFAULT_CLIENT_ID.to_string(), DEFAULT_CLIENT_SECRET.to_string()));
+    }
+
+    Err(VfsError::PermissionDenied(format!(
+        "Missing OAuth Client ID or Client Secret for account '{}'. Set personal credentials with 'ucloud-fs set-credentials', set UCLOUD_CLIENT_ID and UCLOUD_CLIENT_SECRET environment variables, or re-authenticate with 'ucloud-fs login --client-id <ID> --client-secret <SECRET>'.",
+        cred.account_id
+    )))
 }
 
 /// Hydrates file and folder trees from a linked Google account into the in-memory graph.
@@ -96,6 +180,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             cmd_login(custom_id, custom_secret).await?;
+        }
+        "set-credentials" | "set-client" | "config-credentials" => {
+            let mut custom_id = None;
+            let mut custom_secret = None;
+            let mut reset_to_default = false;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--client-id" && i + 1 < args.len() {
+                    custom_id = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--client-secret" && i + 1 < args.len() {
+                    custom_secret = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--reset" || args[i] == "--default" {
+                    reset_to_default = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_set_credentials(custom_id, custom_secret, reset_to_default).await?;
+        }
+        "remove-account" | "remove" => {
+            let target_email = args.get(2).map(String::as_str);
+            cmd_remove_account(target_email).await?;
+        }
+        "prune-accounts" => {
+            let keep_email = args.get(2).map(String::as_str).unwrap_or("ucloudfs@gmail.com");
+            cmd_prune_accounts(keep_email).await?;
+        }
+        "clear-accounts" | "reset-vault" => {
+            cmd_clear_accounts().await?;
         }
         "status" => {
             cmd_status().await?;
@@ -138,14 +254,22 @@ fn print_usage() {
     );
     println!("Usage: ucloud-fs <COMMAND> [OPTIONS]\n");
     println!("Commands:");
-    println!("  add-account   Link an additional Google Drive account (alias: login)");
-    println!("                Options: [--client-id <ID>] [--client-secret <SECRET>]");
-    println!("  login         Link a Google Drive account via OAuth 2.0 PKCE loopback");
-    println!("  status        Display encrypted vault status and live storage quota");
-    println!("  test-live     Execute real-world live test suite against linked account");
-    println!("  mount [DRIVE] Mount the unified virtual filesystem (default: X:)");
-    println!("                Options: [--label <NAME>] [--volume-label <NAME>] (default: ucloud)");
-    println!("  help          Show this help message\n");
+    println!("  add-account     Link an additional Google Drive account (alias: login)");
+    println!("                  Options: [--client-id <ID>] [--client-secret <SECRET>]");
+    println!("  login           Link a Google Drive account via OAuth 2.0 PKCE loopback");
+    println!("                  Options: [--client-id <ID>] [--client-secret <SECRET>]");
+    println!("  set-credentials Configure personal Google OAuth Client ID and Secret as primary");
+    println!("                  Options: [--client-id <ID>] [--client-secret <SECRET>] [--reset]");
+    println!("  remove-account  Remove a linked Google Drive account from the vault");
+    println!("                  Usage: ucloud-fs remove-account <EMAIL>");
+    println!("  clear-accounts  Remove all linked accounts from the vault");
+    println!("  prune-accounts  Remove all accounts except the specified account");
+    println!("                  Usage: ucloud-fs prune-accounts [KEEP_EMAIL]");
+    println!("  status          Display encrypted vault status and live storage quota");
+    println!("  test-live       Execute real-world live test suite against linked account");
+    println!("  mount [DRIVE]   Mount the unified virtual filesystem (default: X:)");
+    println!("                  Options: [--label <NAME>] [--volume-label <NAME>] (default: ucloud)");
+    println!("  help            Show this help message\n");
 }
 
 async fn load_vault_credentials() -> Result<Vec<AccountCredentials>, VfsError> {
@@ -184,47 +308,69 @@ async fn cmd_login(
         "================================================================================\n"
     );
 
+    let (saved_id, saved_secret) = load_saved_client_credentials()
+        .map(|(a, b)| (Some(a), Some(b)))
+        .unwrap_or((None, None));
+
     let client_id = match custom_id
         .or_else(|| std::env::var("UCLOUD_CLIENT_ID").ok())
         .or_else(|| std::env::var("GOOGLE_CLIENT_ID").ok())
+        .or(saved_id)
     {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
-            use std::io::Write;
-            print!("Enter Google OAuth Client ID: ");
-            std::io::stdout().flush().ok();
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            let trimmed = input.trim().to_string();
-            if trimmed.is_empty() {
-                return Err(Box::new(VfsError::PermissionDenied(
-                    "No Google Client ID provided. Pass --client-id <ID> or set UCLOUD_CLIENT_ID.".to_string(),
-                )));
+            if !DEFAULT_CLIENT_ID.is_empty() {
+                DEFAULT_CLIENT_ID.to_string()
+            } else {
+                use std::io::Write;
+                print!("Enter Google OAuth Client ID: ");
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(Box::new(VfsError::PermissionDenied(
+                        "No Google Client ID provided. Pass --client-id <ID> or set UCLOUD_CLIENT_ID.".to_string(),
+                    )));
+                }
+                trimmed
             }
-            trimmed
         }
     };
 
     let client_secret = match custom_secret
         .or_else(|| std::env::var("UCLOUD_CLIENT_SECRET").ok())
         .or_else(|| std::env::var("GOOGLE_CLIENT_SECRET").ok())
+        .or(saved_secret)
     {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            use std::io::Write;
-            print!("Enter Google OAuth Client Secret: ");
-            std::io::stdout().flush().ok();
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            let trimmed = input.trim().to_string();
-            if trimmed.is_empty() {
-                return Err(Box::new(VfsError::PermissionDenied(
-                    "No Google Client Secret provided. Pass --client-secret <SECRET> or set UCLOUD_CLIENT_SECRET.".to_string(),
-                )));
+            if !DEFAULT_CLIENT_SECRET.is_empty() {
+                DEFAULT_CLIENT_SECRET.to_string()
+            } else {
+                use std::io::Write;
+                print!("Enter Google OAuth Client Secret: ");
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(Box::new(VfsError::PermissionDenied(
+                        "No Google Client Secret provided. Pass --client-secret <SECRET> or set UCLOUD_CLIENT_SECRET.".to_string(),
+                    )));
+                }
+                trimmed
             }
-            trimmed
         }
     };
+
+    if client_id != DEFAULT_CLIENT_ID || client_secret != DEFAULT_CLIENT_SECRET {
+        if let Err(e) = save_saved_client_credentials(&client_id, &client_secret) {
+            warn!("Failed to persist client credentials to {CLIENT_CREDENTIALS_FILE}: {e}");
+        } else {
+            println!("  [Persisted] Client ID and Secret saved to {CLIENT_CREDENTIALS_FILE} as primary.");
+        }
+    }
 
     // Bind loopback on 127.0.0.1:8080 (fallback to 127.0.0.1:0)
     let listener = match TcpListener::bind("127.0.0.1:8080").await {
@@ -349,6 +495,175 @@ async fn cmd_login(
     println!("\nCredentials encrypted and stored in {VAULT_FILE}");
     println!("You can now run: ucloud-fs test-live OR ucloud-fs mount X:\n");
 
+    Ok(())
+}
+
+async fn cmd_remove_account(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut creds = load_vault_credentials().await?;
+    if creds.is_empty() {
+        println!("\nNo linked accounts found in {VAULT_FILE}.\n");
+        return Ok(());
+    }
+
+    let email = match target {
+        Some(e) => e.trim().to_string(),
+        None => {
+            use std::io::Write;
+            println!("\nCurrent linked accounts:");
+            for (idx, c) in creds.iter().enumerate() {
+                println!("  [{}] {}", idx + 1, c.account_id);
+            }
+            print!("\nEnter email address of account to remove: ");
+            let _ = std::io::stdout().flush();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        }
+    };
+
+    if email.is_empty() {
+        println!("No account specified. Aborted.");
+        return Ok(());
+    }
+
+    let initial_len = creds.len();
+    creds.retain(|c| !c.account_id.eq_ignore_ascii_case(&email));
+
+    if creds.len() < initial_len {
+        save_vault_credentials(&creds).await?;
+        println!("\nSUCCESS: Removed account '{email}' from {VAULT_FILE}.");
+        println!("Remaining linked account(s): {}", creds.len());
+    } else {
+        println!("\nAccount '{email}' was not found in {VAULT_FILE}.");
+    }
+
+    Ok(())
+}
+
+async fn cmd_set_credentials(
+    custom_id: Option<String>,
+    custom_secret: Option<String>,
+    reset_to_default: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "\n================================================================================"
+    );
+    println!("  ucloud-fs Primary OAuth Credentials Configuration");
+    println!(
+        "================================================================================\n"
+    );
+
+    if reset_to_default {
+        clear_saved_client_credentials()?;
+        let mut creds = load_vault_credentials().await.unwrap_or_default();
+        if !creds.is_empty() {
+            for c in &mut creds {
+                c.client_id = Some(DEFAULT_CLIENT_ID.to_string());
+                c.client_secret = Some(DEFAULT_CLIENT_SECRET.to_string());
+            }
+            save_vault_credentials(&creds).await?;
+        }
+        println!("Primary credentials reset to built-in project defaults.");
+        println!("  Default Client ID: {}", DEFAULT_CLIENT_ID);
+        println!("  Default Client Secret: [CONFIGURED]");
+        println!("================================================================================\n");
+        return Ok(());
+    }
+
+    let client_id = match custom_id {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            use std::io::Write;
+            print!("Enter your personal Google OAuth Client ID: ");
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(Box::new(VfsError::PermissionDenied(
+                    "Client ID cannot be empty. Pass --client-id <ID> or enter interactively.".to_string(),
+                )));
+            }
+            trimmed
+        }
+    };
+
+    let client_secret = match custom_secret {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            use std::io::Write;
+            print!("Enter your personal Google OAuth Client Secret: ");
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(Box::new(VfsError::PermissionDenied(
+                    "Client Secret cannot be empty. Pass --client-secret <SECRET> or enter interactively.".to_string(),
+                )));
+            }
+            trimmed
+        }
+    };
+
+    save_saved_client_credentials(&client_id, &client_secret)?;
+
+    let mut creds = load_vault_credentials().await.unwrap_or_default();
+    if !creds.is_empty() {
+        for c in &mut creds {
+            c.client_id = Some(client_id.clone());
+            c.client_secret = Some(client_secret.clone());
+        }
+        save_vault_credentials(&creds).await?;
+        println!(
+            "Updated {} existing linked account(s) in vault to use your new primary credentials.",
+            creds.len()
+        );
+    }
+
+    println!("\nPrimary Google OAuth credentials successfully configured!");
+    println!("  Saved Client ID: {}", client_id);
+    println!("  Saved Client Secret: [CONFIGURED]");
+    println!("All subsequent 'login', 'add-account', and background token refreshes");
+    println!("will now use your personal Google Cloud Console project by default.");
+    println!("================================================================================\n");
+
+    Ok(())
+}
+
+async fn cmd_prune_accounts(keep_email: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut creds = load_vault_credentials().await?;
+    println!("Loading vault credentials... found {} account(s).", creds.len());
+
+    let initial_count = creds.len();
+    creds.retain(|c| c.account_id.eq_ignore_ascii_case(keep_email));
+
+    for c in &mut creds {
+        let (cid, csec) = resolve_client_credentials(c)
+            .unwrap_or_else(|_| (DEFAULT_CLIENT_ID.to_string(), DEFAULT_CLIENT_SECRET.to_string()));
+        c.client_id = Some(cid);
+        c.client_secret = Some(csec);
+    }
+
+    save_vault_credentials(&creds).await?;
+    println!(
+        "Vault pruned successfully: removed {} account(s).",
+        initial_count.saturating_sub(creds.len())
+    );
+    println!(
+        "Retained account(s): {} (configured with primary Client ID & Secret).",
+        creds.len()
+    );
+    for c in &creds {
+        println!("  - Account: {}", c.account_id);
+    }
+    Ok(())
+}
+
+async fn cmd_clear_accounts() -> Result<(), Box<dyn std::error::Error>> {
+    save_vault_credentials(&[]).await?;
+    println!("\nSUCCESS: All accounts have been cleared from {VAULT_FILE}.");
+    println!("No accounts are linked by default. Run 'ucloud-fs login' to link an account before mounting.\n");
     Ok(())
 }
 

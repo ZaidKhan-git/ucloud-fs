@@ -382,14 +382,33 @@ impl InMemoryRoutingTable {
         let base_key = (parent_ino, canonical_base.clone());
 
         if let Some(acc_new) = account_id {
+            // Check 1: If this cloud folder is ALREADY registered in reverse_cloud_index, return its inode directly!
+            if let Some(gid) = google_folder_id
+                && let Some(existing_ino) = self.lookup_by_cloud_id(acc_new, gid)
+            {
+                return Ok(existing_ino);
+            }
+
             let new_abbr = Self::account_abbreviation(acc_new);
 
             if self.collided_dirs.contains_key(&base_key) {
-                // Already collided: create with disambiguated name
+                // Check if acc_new already has a disambiguated directory under parent_ino
                 let mut counter = 1;
                 let final_dir_name = loop {
                     let candidate = Self::format_disambiguated_name(name, &new_abbr, counter);
-                    if self.lookup(parent_ino, &candidate).is_none() {
+                    if let Some(existing_dis_ino) = self.lookup(parent_ino, &candidate) {
+                        if let Some(guard) = self.virtual_folders.get(&existing_dis_ino)
+                            && guard.value().contains_key(acc_new)
+                        {
+                            if let Some(gid) = google_folder_id {
+                                let mut entry = self.virtual_folders.entry(existing_dis_ino).or_default();
+                                entry.insert(acc_new.to_string(), gid.to_string());
+                                self.reverse_cloud_index
+                                    .insert((acc_new.to_string(), gid.to_string()), existing_dis_ino);
+                            }
+                            return Ok(existing_dis_ino);
+                        }
+                    } else {
                         break candidate;
                     }
                     counter += 1;
@@ -916,6 +935,10 @@ impl InMemoryRoutingTable {
                 self.reverse_cloud_index.remove(&(acc, gid));
             }
         }
+        self.collided_dirs
+            .remove(&(parent_ino, canonical_lookup_key(&removed_node.name)));
+        self.collided_dirs
+            .remove(&(parent_ino, canonical_lookup_key(name)));
 
         Ok(removed_node)
     }
