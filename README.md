@@ -81,13 +81,13 @@ Open Windows Explorer to browse `X:` as a standard local drive!
 
 ---
 
-## Using Your Personal Google OAuth Credentials
+## Using Your Personal Google OAuth Credentials  [Recommended]
 
 > [!IMPORTANT]
 > **Why set up your own Google Cloud project?**
 > By default, `ucloud-fs` includes a built-in project Client ID and Secret for immediate out-of-the-box use. However, because Google marks unverified third-party OAuth apps in **"Testing"** mode, Google blocks access for accounts not explicitly added to that specific project's test users list (showing error: `Error 403: access_denied - ucloud-fs has not completed the Google verification process`).
 >
-> Setting up your own free Google Cloud Console project takes less than 2 minutes and grants you **100% independence**, allowing you to link any of your personal or work accounts without restrictions.
+> Setting up your own free Google Cloud Console project takes less than 2 minutes and grants you **100% independence** from third party client handling sensitive data, allowing you to link any of your personal or work accounts without restrictions.
 
 ### Step-by-Step Setup Guide
 
