@@ -14,7 +14,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use ucloud_fs::error::VfsError;
-use ucloud_fs::network::client::{GoogleDriveClient, GoogleFileInput};
+use ucloud_fs::network::client::{GoogleDriveClient, GoogleFileInput, HydratedAccountData};
 use ucloud_fs::network::limiter::MultiTierLimiter;
 use ucloud_fs::routing::placement::PlacementEngine;
 use ucloud_fs::routing::sync::DeltaSyncEngine;
@@ -62,6 +62,14 @@ fn resolve_client_credentials(cred: &AccountCredentials) -> Result<(String, Stri
             cred.account_id
         ))),
     }
+}
+
+/// Hydrates file and folder trees from a linked Google account into the in-memory graph.
+pub fn hydrate_account_into_table(
+    routing_table: &Arc<InMemoryRoutingTable>,
+    data: &HydratedAccountData,
+) -> Result<(), VfsError> {
+    routing_table.hydrate_account_data(data)
 }
 
 #[tokio::main]
@@ -526,7 +534,7 @@ async fn cmd_test_live() -> Result<(), Box<dyn std::error::Error>> {
     let hydration_duration = start_time.elapsed();
 
     let routing_table = Arc::new(InMemoryRoutingTable::new());
-    routing_table.hydrate_account_data(&hydrated_data)?;
+    hydrate_account_into_table(&routing_table, &hydrated_data)?;
 
     let file_count = hydrated_data.files.len();
     println!(
@@ -730,7 +738,7 @@ async fn cmd_mount(drive_letter: String, volume_label: String) -> Result<(), Box
 
                 sync_engine.set_start_page_token(&cred.account_id, data.start_page_token.clone());
 
-                if let Err(e) = routing_table.hydrate_account_data(&data) {
+                if let Err(e) = hydrate_account_into_table(&routing_table, &data) {
                     warn!(account = %cred.account_id, error = %e, "Failed to fully hydrate routing table");
                 }
 
@@ -827,7 +835,7 @@ async fn cmd_mount(drive_letter: String, volume_label: String) -> Result<(), Box
                                         data.storage_limit_bytes,
                                         data.storage_used_bytes,
                                     );
-                                    let _ = routing_table_bg.hydrate_account_data(&data);
+                                    let _ = hydrate_account_into_table(&routing_table_bg, &data);
                                     notifier_bg.notify_updated("/");
                                     info!(
                                         account = %cred.account_id,

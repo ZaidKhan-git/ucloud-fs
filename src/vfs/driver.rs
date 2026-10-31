@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::error::VfsError;
@@ -84,15 +84,19 @@ struct WritePendingState {
     overwriting_existing: Option<(u64, String, String)>,
 }
 
-/// Block size for the shared inode page cache (1 MB aligned blocks).
-pub const SHARED_BLOCK_SIZE: u64 = 1024 * 1024;
-/// Maximum number of blocks stored in the shared inode page cache (96 MB LRU ceiling).
-pub const MAX_SHARED_BLOCKS: usize = 96;
+/// Block size for the shared inode page cache (512 KB fast blocks).
+pub const SHARED_BLOCK_SIZE: u64 = 512 * 1024;
+/// Maximum number of blocks stored in the shared inode page cache (128 MB total shared cache).
+pub const MAX_SHARED_BLOCKS: usize = 256;
+/// Lookahead window for continuous background prefetching (8 MB continuous lookahead).
+pub const READAHEAD_BLOCKS: u64 = 16;
+/// Maximum concurrent HTTP/2 prefetch streams per cached source.
+pub const MAX_CONCURRENT_PREFETCH: usize = 4;
 
-/// Shared Inode Page Cache dividing files into 1 MB blocks with LRU eviction and single-flight deduplication.
+/// Shared Inode Page Cache dividing files into 512 KB blocks with LRU eviction and single-flight Notify coordination.
 pub struct SharedBlockCache {
     blocks: DashMap<(u64, u64), (Instant, Bytes)>,
-    in_flight: DashMap<(u64, u64), tokio::sync::broadcast::Sender<Bytes>>,
+    in_flight: DashMap<(u64, u64), Arc<Notify>>,
     max_blocks: usize,
 }
 
@@ -141,27 +145,23 @@ impl SharedBlockCache {
         self.blocks.contains_key(&(ino, block_index)) || self.in_flight.contains_key(&(ino, block_index))
     }
 
-    /// Registers an in-flight block channel synchronously and returns the sender.
-    /// If the block is already resident or in flight, returns None.
-    pub fn register_in_flight(&self, ino: u64, block_index: u64) -> Option<tokio::sync::broadcast::Sender<Bytes>> {
+    /// Registers or retrieves an in-flight Notify for a block.
+    /// Returns `(Arc<Notify>, bool)` where bool is `true` if this caller is the leader that must initiate the fetch.
+    pub fn get_or_create_in_flight(&self, ino: u64, block_index: u64) -> (Arc<Notify>, bool) {
         use dashmap::mapref::entry::Entry;
-        if self.blocks.contains_key(&(ino, block_index)) {
-            return None;
-        }
         match self.in_flight.entry((ino, block_index)) {
-            Entry::Occupied(_) => None,
+            Entry::Occupied(occ) => (Arc::clone(occ.get()), false),
             Entry::Vacant(vac) => {
-                let (tx, _) = tokio::sync::broadcast::channel(1);
-                vac.insert(tx.clone());
-                Some(tx)
+                let notify = Arc::new(Notify::new());
+                vac.insert(Arc::clone(&notify));
+                (notify, true)
             }
         }
     }
 
-    /// Subscribes to an in-flight block download if one exists.
-    #[must_use]
-    pub fn subscribe_in_flight(&self, ino: u64, block_index: u64) -> Option<tokio::sync::broadcast::Receiver<Bytes>> {
-        self.in_flight.get(&(ino, block_index)).map(|tx| tx.subscribe())
+    /// Removes an in-flight entry for a completed or aborted block fetch.
+    pub fn remove_in_flight(&self, ino: u64, block_index: u64) {
+        self.in_flight.remove(&(ino, block_index));
     }
 
     /// Inserts a block into cache with LRU eviction when reaching capacity.
@@ -186,66 +186,6 @@ impl SharedBlockCache {
         self.blocks.insert((ino, block_index), (Instant::now(), bytes));
     }
 
-    /// Gets a block from cache or fetches it with single-flight deduplication across handles.
-    pub async fn get_or_fetch<F, Fut>(
-        &self,
-        ino: u64,
-        block_index: u64,
-        fetch_fut: F,
-    ) -> Result<Bytes, VfsError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Bytes, VfsError>>,
-    {
-        if let Some(bytes) = self.get(ino, block_index) {
-            return Ok(bytes);
-        }
-
-        enum FlightStatus {
-            Leader(tokio::sync::broadcast::Sender<Bytes>),
-            Follower(tokio::sync::broadcast::Receiver<Bytes>),
-        }
-
-        let flight_status = {
-            use dashmap::mapref::entry::Entry;
-            match self.in_flight.entry((ino, block_index)) {
-                Entry::Occupied(occ) => FlightStatus::Follower(occ.get().subscribe()),
-                Entry::Vacant(vac) => {
-                    let (tx, _) = tokio::sync::broadcast::channel(1);
-                    vac.insert(tx.clone());
-                    FlightStatus::Leader(tx)
-                }
-            }
-        };
-
-        match flight_status {
-            FlightStatus::Follower(mut rx) => match rx.recv().await {
-                Ok(bytes) => Ok(bytes),
-                Err(_) => {
-                    if let Some(bytes) = self.get(ino, block_index) {
-                        Ok(bytes)
-                    } else {
-                        let bytes = fetch_fut().await?;
-                        self.insert(ino, block_index, bytes.clone());
-                        Ok(bytes)
-                    }
-                }
-            },
-            FlightStatus::Leader(tx) => {
-                let res = fetch_fut().await;
-                self.in_flight.remove(&(ino, block_index));
-                match res {
-                    Ok(bytes) => {
-                        self.insert(ino, block_index, bytes.clone());
-                        let _ = tx.send(bytes.clone());
-                        Ok(bytes)
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-        }
-    }
-
     /// Clears all cached blocks and in-flight tracking.
     pub fn clear(&self) {
         self.blocks.clear();
@@ -265,8 +205,8 @@ impl SharedBlockCache {
     }
 }
 
-/// Direct page-cache byte source with 1 MB aligned blocks, smart tail-seek awareness,
-/// lock-free parallel reads, and non-blocking background read-ahead.
+/// Direct page-cache byte source with 512 KB fast blocks, smart tail-seek awareness,
+/// lock-free parallel reads, and paced background read-ahead.
 pub struct CachedByteSource {
     pub ino: u64,
     pub file_size: u64,
@@ -275,6 +215,7 @@ pub struct CachedByteSource {
     pub hot_header_cache: Arc<DashMap<u64, HotHeaderCacheEntry>>,
     pub rt_handle: tokio::runtime::Handle,
     pub active_cursor: Arc<AtomicU64>,
+    pub prefetch_semaphore: Arc<Semaphore>,
 }
 
 impl CachedByteSource {
@@ -295,11 +236,27 @@ impl CachedByteSource {
             hot_header_cache,
             rt_handle,
             active_cursor: Arc::new(AtomicU64::new(0)),
+            prefetch_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_PREFETCH)),
         };
         // Proactively prime block 0 and read-ahead ahead of first read
         source.prefetch_block(0);
-        source.ensure_readahead_buffered(0);
+        source.trigger_paced_readahead(0);
         source
+    }
+
+    /// Clones Arc references to produce an owned source instance for moving into detached tokio::spawn tasks.
+    #[must_use]
+    pub fn clone_source(&self) -> Self {
+        Self {
+            ino: self.ino,
+            file_size: self.file_size,
+            inner: Arc::clone(&self.inner),
+            cache: Arc::clone(&self.cache),
+            hot_header_cache: Arc::clone(&self.hot_header_cache),
+            rt_handle: self.rt_handle.clone(),
+            active_cursor: Arc::clone(&self.active_cursor),
+            prefetch_semaphore: Arc::clone(&self.prefetch_semaphore),
+        }
     }
 
     /// Spawns a background task to fetch a single block into shared cache if not already cached or in-flight.
@@ -313,31 +270,18 @@ impl CachedByteSource {
             return;
         }
 
-        if let Some(tx) = self.cache.register_in_flight(self.ino, block_index) {
-            let ino = self.ino;
-            let file_size = self.file_size;
-            let inner = Arc::clone(&self.inner);
-            let cache = Arc::clone(&self.cache);
-
-            self.rt_handle.spawn(async move {
-                let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
-                    .min(file_size)
-                    .saturating_sub(1);
-                let res = inner.fetch_range(b_start, b_end).await;
-                cache.in_flight.remove(&(ino, block_index));
-                if let Ok(bytes) = res {
-                    cache.insert(ino, block_index, bytes.clone());
-                    let _ = tx.send(bytes);
-                }
-            });
-        }
+        let source = self.clone_source();
+        self.rt_handle.spawn(async move {
+            let _ = source.get_or_fetch_block(block_index).await;
+        });
     }
 
-    /// Ensures the next 6-8 blocks ahead of `current_block` are present in cache or actively in flight.
-    pub fn ensure_readahead_buffered(&self, current_block: u64) {
+    /// Triggers paced sequential read-ahead for up to READAHEAD_BLOCKS ahead of `current_block`,
+    /// bounded by the prefetch semaphore (up to MAX_CONCURRENT_PREFETCH parallel HTTP/2 streams).
+    pub fn trigger_paced_readahead(&self, current_block: u64) {
         let max_block = self.file_size.saturating_sub(1) / SHARED_BLOCK_SIZE;
         let target_start = current_block + 1;
-        let target_end = (current_block + 8).min(max_block);
+        let target_end = (current_block + READAHEAD_BLOCKS).min(max_block);
         if target_start > target_end {
             return;
         }
@@ -345,77 +289,91 @@ impl CachedByteSource {
         self.active_cursor.store(current_block, Ordering::SeqCst);
 
         for next_b in target_start..=target_end {
-            self.prefetch_block(next_b);
+            if self.cache.contains_or_in_flight(self.ino, next_b) {
+                continue;
+            }
+
+            let Ok(permit) = self.prefetch_semaphore.clone().try_acquire_owned() else {
+                // Concurrency throttle: all prefetch slots are busy
+                break;
+            };
+
+            let source = self.clone_source();
+            self.rt_handle.spawn(async move {
+                let _permit = permit;
+                let _ = source.get_or_fetch_block(next_b).await;
+            });
         }
     }
 
-    /// Alias for backward compatibility and test hooks.
-    pub fn trigger_paced_readahead(&self, current_block: u64) {
-        self.ensure_readahead_buffered(current_block);
+    /// Ensures the blocks ahead of `current_block` are prefetched.
+    pub fn ensure_readahead_buffered(&self, current_block: u64) {
+        self.trigger_paced_readahead(current_block);
     }
 
-    /// Retrieves a block non-blockingly:
-    /// - Hits memory cache immediately if present.
-    /// - If in-flight, awaits with a short timeout before returning zero-padded fallback to never freeze OS read thread.
-    /// - If missing entirely, initiates background prefetch and awaits briefly before zero-padding.
-    pub async fn get_or_fetch_block_nonblocking(&self, block_index: u64) -> Bytes {
+    /// Fetches a single 512 KB block from cache or network with single-flight detached background fetching.
+    pub async fn get_or_fetch_block(&self, block_index: u64) -> Result<Bytes, VfsError> {
         if let Some(bytes) = self.cache.get(self.ino, block_index) {
-            return bytes;
+            return Ok(bytes);
         }
 
         let b_start = block_index * SHARED_BLOCK_SIZE;
         if b_start >= self.file_size {
-            return Bytes::new();
+            return Ok(Bytes::new());
         }
-        let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
-            .min(self.file_size)
-            .saturating_sub(1);
-        let expected_len = (b_end - b_start + 1) as usize;
 
-        // If not already in flight, register and trigger it immediately
+        let (notify, is_leader) = self.cache.get_or_create_in_flight(self.ino, block_index);
+
+        if is_leader {
+            let source = self.clone_source();
+            let notify_task = Arc::clone(&notify);
+            self.rt_handle.spawn(async move {
+                let b_end = ((block_index + 1) * SHARED_BLOCK_SIZE)
+                    .min(source.file_size)
+                    .saturating_sub(1);
+                let res = source.inner.fetch_range(b_start, b_end).await;
+                match res {
+                    Ok(bytes) => {
+                        source.cache.insert(source.ino, block_index, bytes);
+                    }
+                    Err(err) => {
+                        warn!(
+                            ino = source.ino,
+                            block_index,
+                            error = %err,
+                            "Block fetch failed in background task"
+                        );
+                    }
+                }
+                // CRITICAL ANTI-HANG INVARIANT: Always remove in-flight and notify waiters on both Ok and Err
+                source.cache.remove_in_flight(source.ino, block_index);
+                notify_task.notify_waiters();
+            });
+        }
+
+        let notified = notify.notified();
+        if let Some(bytes) = self.cache.get(self.ino, block_index) {
+            return Ok(bytes);
+        }
         if !self.cache.is_in_flight(self.ino, block_index) {
-            self.prefetch_block(block_index);
-            self.ensure_readahead_buffered(block_index);
+            return self.cache.get(self.ino, block_index).ok_or_else(|| {
+                VfsError::InternalFault(format!(
+                    "Failed to fetch block {block_index} for inode {}",
+                    self.ino
+                ))
+            });
         }
 
-        // Subscribe to in-flight receiver
-        let receiver = self.cache.subscribe_in_flight(self.ino, block_index);
+        notified.await;
 
-        let timeout_duration = if block_index == 0 {
-            Duration::from_millis(500)
+        if let Some(bytes) = self.cache.get(self.ino, block_index) {
+            Ok(bytes)
         } else {
-            Duration::from_millis(50)
-        };
-
-        if let Some(mut rx) = receiver {
-            match tokio::time::timeout(timeout_duration, rx.recv()).await {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(_)) => {
-                    self.cache
-                        .get(self.ino, block_index)
-                        .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
-                }
-                Err(_) => {
-                    debug!(
-                        ino = self.ino,
-                        block_index,
-                        "Read timeout waiting for in-flight download - returning instant non-blocking zero-pad"
-                    );
-                    self.cache
-                        .get(self.ino, block_index)
-                        .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
-                }
-            }
-        } else {
-            self.cache
-                .get(self.ino, block_index)
-                .unwrap_or_else(|| Bytes::from(vec![0u8; expected_len]))
+            Err(VfsError::InternalFault(format!(
+                "Failed to fetch block {block_index} for inode {}",
+                self.ino
+            )))
         }
-    }
-
-    /// Fetches a single 1 MB block from cache or network.
-    pub async fn get_or_fetch_block(&self, block_index: u64) -> Result<Bytes, VfsError> {
-        Ok(self.get_or_fetch_block_nonblocking(block_index).await)
     }
 
     /// Fetches an exact byte range directly and lock-free for OS ReadFile requests.
@@ -436,7 +394,7 @@ impl CachedByteSource {
             let off = offset as usize;
             if off + req_len <= head.len() {
                 debug!(ino = self.ino, offset, req_len, "Hot Header Cache head hit (<0.001 ms)");
-                self.ensure_readahead_buffered(0);
+                self.trigger_paced_readahead(0);
                 return Ok(Bytes::copy_from_slice(&head[off..off + req_len]));
             }
         }
@@ -460,21 +418,22 @@ impl CachedByteSource {
         let end_block = inclusive_end / SHARED_BLOCK_SIZE;
 
         // Check if offset is in the Tail Zone (final 4 MB of a file > 16 MB)
-        let is_tail_zone = file_size > 16 * 1024 * 1024
+        let in_tail_zone = file_size > 16 * 1024 * 1024
             && offset >= file_size.saturating_sub(4 * 1024 * 1024);
 
-        // Always proactively trigger background readahead ahead of the current read point
-        if !is_tail_zone {
-            self.ensure_readahead_buffered(end_block);
+        // Always proactively trigger background readahead ahead of the current read point if not in tail zone
+        if !in_tail_zone {
+            self.trigger_paced_readahead(end_block);
         }
 
-        // Fetch required block(s) non-blockingly
+        // Fetch required block(s) sequentially and genuinely without timeout zeroes
         let mut assembled = Vec::with_capacity(req_len);
+        let mut cur_block = start_block;
 
-        for b in start_block..=end_block {
-            let block_bytes = self.get_or_fetch_block_nonblocking(b).await;
-            let b_start = b * SHARED_BLOCK_SIZE;
-            let b_end = ((b + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
+        while cur_block <= end_block {
+            let block_bytes = self.get_or_fetch_block(cur_block).await?;
+            let b_start = cur_block * SHARED_BLOCK_SIZE;
+            let b_end = ((cur_block + 1) * SHARED_BLOCK_SIZE).min(file_size).saturating_sub(1);
 
             let overlap_start = offset.max(b_start);
             let overlap_end = inclusive_end.min(b_end);
@@ -485,11 +444,9 @@ impl CachedByteSource {
                 if rel_start < block_bytes.len() {
                     let slice_end = rel_end.min(block_bytes.len());
                     assembled.extend_from_slice(&block_bytes[rel_start..slice_end]);
-                } else {
-                    let slice_len = rel_end.saturating_sub(rel_start);
-                    assembled.resize(assembled.len() + slice_len, 0);
                 }
             }
+            cur_block += 1;
         }
 
         // Populate Hot Header Cache for head (if reading from offset 0)
@@ -506,7 +463,7 @@ impl CachedByteSource {
         }
 
         // Populate Hot Header Cache for tail (if in tail zone)
-        if is_tail_zone && !assembled.is_empty() {
+        if in_tail_zone && !assembled.is_empty() {
             let mut entry = self.hot_header_cache.entry(self.ino).or_insert_with(|| HotHeaderCacheEntry {
                 head: None,
                 tail: None,

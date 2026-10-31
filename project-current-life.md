@@ -1374,3 +1374,76 @@
 
 
 
+
+
+---
+
+## [Entry 033] - 2026-10-31T17:10:00+05:30
+- **Stage:** STAGE 8H: PROGRESSIVE VFS STREAMING REDESIGN, DELTA SYNC DISAMBIGUATION PRESERVATION, & MULTI-PASS TOPOLOGICAL FOLDER HYDRATION
+- **Status:** PASSING (ALL 70 TESTS PASSED: 39 UNIT + 31 INTEGRATION TESTS ACROSS 13 TEST SUITES, CLIPPY 0 WARNINGS, RELEASE BINARY COMPILED).
+- **Files Modified:**
+  ```
+  src/main.rs
+  src/routing/sync.rs
+  src/routing/table.rs
+  src/vfs/driver.rs
+  tests/delta_sync.rs
+  tests/vfs_lifecycle.rs
+  project-current-life.md
+  ```
+- **Reason for Change:**
+  1. **R1: VFS Driver Progressive Fetching Redesign & Elimination of Fake Zeroes (`src/vfs/driver.rs`):**
+     - Windows Media Player failed with error `0xC00D36C4` (`MF_E_UNSUPPORTED_BYTESTREAM_TYPE`) because `CachedByteSource` imposed a 10ms/50ms timeout on in-flight block downloads and returned fake zero-filled buffers (`vec![0u8; expected_len]` and `assembled.resize(..., 0)`). This corrupted MP4 container headers (`ftyp`, `moov`, `trak`).
+     - Removed the 10ms timeout and fake zero-fill fallback: `fetch_range` now directly awaits `self.get_or_fetch_block(cur_block).await?` guaranteeing 100% authentic bytes.
+     - Reconfigured VFS driver constants: `SHARED_BLOCK_SIZE = 512 * 1024` (512 KB fast blocks cutting initial latency in half), `MAX_SHARED_BLOCKS = 256` (128 MB total shared cache ceiling), `READAHEAD_BLOCKS = 16` (8 MB continuous lookahead), and `MAX_CONCURRENT_PREFETCH = 4` (bounded parallel HTTP/2 streams via semaphore).
+     - Refactored `SharedBlockCache` single-flight synchronization to use `Arc<tokio::sync::Notify>`. Downloads execute in detached `tokio::spawn` tasks using `clone_source()`.
+     - Critical Anti-Hang Invariant: `in_flight.remove(&key)` and `notify.notify_waiters()` are unconditionally invoked on both `Ok` and `Err` outcomes, ensuring awaiting callers never hang indefinitely.
+     - Paced lookahead is triggered immediately on both cache hits and misses before the block loop if `!in_tail_zone` (tail zone defined as `offset >= file_size - 4 MB` for files > 16 MB).
+  2. **R2: Preservation of Collision Disambiguation Across Delta Sync (`src/routing/table.rs`, `src/routing/sync.rs`):**
+     - When Google Drive delta sync polled `changes.list`, untagged remote names (e.g. `JaipurTrip2024`) stripped account abbreviations (`(abbr)`) from collided nodes and moved nested files to root when `parents` was omitted.
+     - Added `update_existing_directory` and `update_existing_file` to `InMemoryRoutingTable`. When updating an existing node, the table checks `collided_dirs` and `collided_files`. If collided, the node retains its formatted account abbreviation (`format_folder_disambiguated` / `format_disambiguated`) and updates `lookup_by_name`, parent `children`, and `node.name` only when display name or parent changed, adhering to strict Single-Guard discipline on DashMap operations.
+     - Registered `(account_id, remote_folder_id) -> ino` in `reverse_cloud_index` inside `record_remote_folder_id` and added `get_ino_by_cloud_id` to resolve lazy-materialized folders.
+     - Updated `resolve_parent_ino` in `src/routing/sync.rs` to accept `existing_parent_ino: Option<u64>`. When `parents` is `None` or empty, the existing parent hierarchy is preserved rather than resetting to `ROOT_INO`.
+     - In `DeltaSyncEngine::apply_changes`, looked up `existing_ino` and `existing_parent_ino` before `resolve_parent_ino`, captured the effective display name returned by `update_existing_directory` / `update_existing_file`, and passed it to `Self::format_notify_path` so Windows Explorer receives shell notifications for the true disambiguated `(abbr)` name.
+  3. **R3: 16-Pass Topological Folder Hydration (`src/routing/table.rs`, `src/main.rs`):**
+     - Google Drive `files.list` returns folders in arbitrary order. A naive or single-pass loop prematurely collapsed child folders arriving before their parents to `ROOT_INO`.
+     - Implemented multi-pass topological folder hydration (up to 16 passes) in `InMemoryRoutingTable::hydrate_account_data`. Precomputes `fetched_folder_ids` to distinguish pending folders in the account tree from external folder boundaries. In each pass, folders are inserted if their parent is `"root"`, registered in `get_ino_by_cloud_id`, or external (`!fetched_folder_ids.contains(pid)`).
+     - Added deadlock/cycle detection terminating early if no folders are placed in a pass, with remaining unplaced folders safely defaulting to `ROOT_INO`. Files are placed in a second phase after all directories are topologically structured.
+     - Implemented `hydrate_account_into_table` in `src/main.rs` and updated all 3 invocation sites (`cmd_test_live`, `cmd_mount`, and background watcher).
+  4. **R4: Dynamic Test Math for Variable Block Sizes (`tests/vfs_lifecycle.rs`):**
+     - In `test_concurrent_overlapped_reads_zero_mutex_contention`, replaced hardcoded block math with `8 * 1024 * 1024 / ucloud_fs::vfs::driver::SHARED_BLOCK_SIZE`, allowing tests to dynamically adapt to 512 KB blocks and any future block size adjustments.
+     - Added regression test `test_cached_byte_source_fetch_range_delayed_non_zero_fidelity` validating 100% genuine non-zero bytes under 80ms network latency (>50ms).
+  5. **R5: Project Ledger & Governance Maintenance:**
+     - Appended `[Entry 033]` to `Z:\ucloud-fs\project-current-life.md` documenting Stage 8H (R1–R5).
+     - Enforced strict negative guardrail: `context.md` in repository root was not created or modified.
+
+## Whats Changed ?
+- `src/vfs/driver.rs`:
+  - Removed 10ms timeout and fake zero padding in `CachedByteSource::fetch_range`.
+  - Configured constants: `SHARED_BLOCK_SIZE = 512 * 1024` (512 KB), `MAX_SHARED_BLOCKS = 256` (128 MB), `READAHEAD_BLOCKS = 16` (8 MB lookahead), `MAX_CONCURRENT_PREFETCH = 4` (4 parallel HTTP/2 streams).
+  - Implemented `CachedByteSource::clone_source` for detached task spawning.
+  - Refactored `SharedBlockCache` in-flight coordination with `tokio::sync::Notify` and anti-hang guarantees (`remove_in_flight` and `notify_waiters` unconditionally executed).
+  - Implemented `trigger_paced_readahead` with semaphore permits and immediate prefetch on cache hits/misses outside tail zone.
+- `src/routing/table.rs`:
+  - Added `get_ino_by_cloud_id` and registered folder IDs in `reverse_cloud_index` inside `record_remote_folder_id`.
+  - Added `format_folder_disambiguated` and `format_disambiguated`.
+  - Implemented `update_existing_directory` and `update_existing_file` preserving disambiguated names across delta sync with Single-Guard discipline.
+  - Implemented 16-pass topological folder hydration in `hydrate_account_data` with `fetched_folder_ids` set and cycle detection.
+  - Exposed `hydrate_account_into_table` method alias and standalone function.
+- `src/routing/sync.rs`:
+  - Updated `resolve_parent_ino` to accept and preserve `existing_parent_ino` when `parents` is empty or None.
+  - Implemented `format_notify_path` helper for root vs nested inodes.
+  - Updated `apply_changes` to look up existing inodes before parent resolution and pass effective disambiguated display names to shell notifications.
+- `src/main.rs`:
+  - Added `hydrate_account_into_table` helper.
+  - Updated `cmd_test_live`, `cmd_mount`, and background watcher to use topological hydration.
+- `tests/vfs_lifecycle.rs`:
+  - Updated block math in `test_concurrent_overlapped_reads_zero_mutex_contention` to dynamically reference `SHARED_BLOCK_SIZE`.
+  - Added regression test `test_cached_byte_source_fetch_range_delayed_non_zero_fidelity`.
+- `tests/delta_sync.rs`:
+  - Added regression test `test_delta_sync_preserves_disambiguated_folder_and_file_names`.
+  - Added regression test `test_out_of_order_nested_folder_hydration`.
+- Full verification:
+  - 70/70 tests passed (39 unit + 31 integration tests across all 13 test suites).
+  - `cargo clippy --all-targets --offline -- -D warnings`: 0 warnings, 0 errors.
+  - `cargo build --release --offline`: Built successfully (`target/release/ucloud-fs.exe`, 3.82 MB).

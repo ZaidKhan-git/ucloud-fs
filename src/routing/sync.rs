@@ -144,6 +144,51 @@ impl DeltaSyncEngine {
         false
     }
 
+    /// Formats a shell notification path for a node under `parent_ino`.
+    ///
+    /// If `parent_ino` is root (`ROOT_INO`), returns `name` directly.
+    /// Otherwise returns `/path/to/parent/name`.
+    #[must_use]
+    pub fn format_notify_path(
+        routing_table: &InMemoryRoutingTable,
+        parent_ino: u64,
+        name: &str,
+    ) -> String {
+        if parent_ino == InMemoryRoutingTable::ROOT_INO {
+            name.to_string()
+        } else if let Some(parent_path) = routing_table.get_path_for_inode(parent_ino) {
+            if parent_path == "/" || parent_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", parent_path.trim_end_matches('/'), name)
+            }
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Resolves the parent inode for a file or folder change.
+    ///
+    /// Preserves `existing_parent_ino` if `parents` is `None` or empty, preventing
+    /// updates from accidentally resetting nested items back to `ROOT_INO`.
+    fn resolve_parent_ino(
+        &self,
+        account_id: &str,
+        parents: Option<&[String]>,
+        existing_parent_ino: Option<u64>,
+    ) -> u64 {
+        let parent_google_id = parents.and_then(|p| p.first()).map(|s| s.as_str());
+        match parent_google_id {
+            None => existing_parent_ino.unwrap_or(InMemoryRoutingTable::ROOT_INO),
+            Some("root") => InMemoryRoutingTable::ROOT_INO,
+            Some(gid) => self
+                .routing_table
+                .lookup_by_cloud_id(account_id, gid)
+                .or(existing_parent_ino)
+                .unwrap_or(InMemoryRoutingTable::ROOT_INO),
+        }
+    }
+
     /// Applies a batch of remote cloud changes into the local in-memory routing table.
     pub async fn apply_changes(
         &self,
@@ -234,58 +279,79 @@ impl DeltaSyncEngine {
                     continue;
                 }
 
-                if let Some(existing_ino) = self.routing_table.lookup_by_cloud_id(account_id, file_id) {
-                    // Update existing inode
-                    if let Some(mut node) = self.routing_table.get_inode(existing_ino) {
-                        if node.name != file.name {
-                            let _ = self.routing_table.rename(
-                                node.parent_ino,
-                                &node.name,
-                                node.parent_ino,
-                                &file.name,
-                            );
-                            node.name = file.name.clone();
-                        }
-                        self.notifier.notify_updated(&node.name);
-                        stats.updated += 1;
-                        debug!(ino = existing_ino, name = %file.name, "Reconciled remote cloud update");
-                    }
-                } else {
-                    // New remote file or folder created directly on web drive
-                    let parent_google_id = file
-                        .parents
-                        .as_ref()
-                        .and_then(|p| p.first())
-                        .map(|s| s.as_str());
+                let existing_ino = self.routing_table.lookup_by_cloud_id(account_id, file_id);
+                let existing_parent_ino = existing_ino.and_then(|ino| {
+                    self.routing_table.get_inode(ino).map(|n| n.parent_ino)
+                });
 
-                    let parent_ino = match parent_google_id {
-                        None | Some("root") => InMemoryRoutingTable::ROOT_INO,
-                        Some(gid) => self
+                let parent_ino = self.resolve_parent_ino(
+                    account_id,
+                    file.parents.as_deref(),
+                    existing_parent_ino,
+                );
+
+                let is_folder = file.mime_type == "application/vnd.google-apps.folder";
+
+                if let Some(existing_ino) = existing_ino {
+                    let effective_display_name = if is_folder {
+                        self.routing_table.update_existing_directory(
+                            existing_ino,
+                            parent_ino,
+                            &file.name,
+                            0,
+                        )
+                    } else {
+                        let existing_size = self
                             .routing_table
-                            .lookup_by_cloud_id(account_id, gid)
-                            .unwrap_or(InMemoryRoutingTable::ROOT_INO),
+                            .get_inode(existing_ino)
+                            .map(|n| n.size)
+                            .unwrap_or(0);
+                        let size = file
+                            .size
+                            .as_ref()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(existing_size);
+                        self.routing_table.update_existing_file(
+                            existing_ino,
+                            parent_ino,
+                            &file.name,
+                            size,
+                            0,
+                        )
                     };
 
-                    let is_folder = file.mime_type == "application/vnd.google-apps.folder";
-
+                    let display_name = effective_display_name.as_deref().unwrap_or(&file.name);
+                    let notify_path = Self::format_notify_path(
+                        &self.routing_table,
+                        parent_ino,
+                        display_name,
+                    );
+                    self.notifier.notify_updated(&notify_path);
+                    stats.updated += 1;
+                    debug!(
+                        ino = existing_ino,
+                        name = %display_name,
+                        "Reconciled remote cloud update"
+                    );
+                } else {
+                    // New remote file or folder created directly on web drive
                     if is_folder {
-                        let _ = self.routing_table.insert_or_merge_directory(
+                        let new_ino = self.routing_table.insert_or_merge_directory(
                             parent_ino,
                             &file.name,
                             Some(account_id),
                             Some(file_id),
                         )?;
-                        let full_path = if parent_ino == InMemoryRoutingTable::ROOT_INO {
-                            file.name.clone()
-                        } else if let Some(parent_path) = self.routing_table.get_path_for_inode(parent_ino) {
-                            if parent_path == "/" || parent_path.is_empty() {
-                                file.name.clone()
-                            } else {
-                                format!("{}/{}", parent_path.trim_end_matches('/'), file.name)
-                            }
-                        } else {
-                            file.name.clone()
-                        };
+                        let display_name = self
+                            .routing_table
+                            .get_inode(new_ino)
+                            .map(|n| n.name)
+                            .unwrap_or_else(|| file.name.clone());
+                        let full_path = Self::format_notify_path(
+                            &self.routing_table,
+                            parent_ino,
+                            &display_name,
+                        );
                         self.notifier.notify_created(&full_path);
                         stats.created += 1;
                         info!(
@@ -295,13 +361,17 @@ impl DeltaSyncEngine {
                             "Reconciled new remote cloud folder into local VFS"
                         );
                     } else {
-                        let size = file.size.as_ref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        let size = file
+                            .size
+                            .as_ref()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
                         let location = StorageLocation::SingleAccount {
                             account_id: account_id.to_string(),
                             google_file_id: file.id.clone(),
                         };
 
-                        let _ = self.routing_table.insert_file(NewFileParams {
+                        let new_ino = self.routing_table.insert_file(NewFileParams {
                             parent_ino,
                             name: &file.name,
                             size,
@@ -312,17 +382,16 @@ impl DeltaSyncEngine {
                             web_view_link: None,
                         })?;
 
-                        let full_path = if parent_ino == InMemoryRoutingTable::ROOT_INO {
-                            file.name.clone()
-                        } else if let Some(parent_path) = self.routing_table.get_path_for_inode(parent_ino) {
-                            if parent_path == "/" || parent_path.is_empty() {
-                                file.name.clone()
-                            } else {
-                                format!("{}/{}", parent_path.trim_end_matches('/'), file.name)
-                            }
-                        } else {
-                            file.name.clone()
-                        };
+                        let display_name = self
+                            .routing_table
+                            .get_inode(new_ino)
+                            .map(|n| n.name)
+                            .unwrap_or_else(|| file.name.clone());
+                        let full_path = Self::format_notify_path(
+                            &self.routing_table,
+                            parent_ino,
+                            &display_name,
+                        );
                         self.notifier.notify_created(&full_path);
                         stats.created += 1;
                         info!(
@@ -408,3 +477,14 @@ impl DeltaSyncEngine {
         })
     }
 }
+
+/// Formats a shell notification path for a node under `parent_ino`.
+#[must_use]
+pub fn format_notify_path(
+    routing_table: &InMemoryRoutingTable,
+    parent_ino: u64,
+    name: &str,
+) -> String {
+    DeltaSyncEngine::format_notify_path(routing_table, parent_ino, name)
+}
+

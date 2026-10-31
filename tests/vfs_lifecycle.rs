@@ -780,7 +780,8 @@ async fn test_concurrent_overlapped_reads_zero_mutex_contention() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // 6. Verify that paced read-ahead has pre-populated blocks up to 8 MB ahead in RAM
-    let blocks_populated = (1..=8)
+    let max_readahead_block = 8 * 1024 * 1024 / ucloud_fs::vfs::driver::SHARED_BLOCK_SIZE;
+    let blocks_populated = (1..=max_readahead_block)
         .filter(|&b| driver.shared_block_cache.contains(video_ino, b))
         .count();
     assert!(
@@ -849,4 +850,66 @@ async fn test_configurable_and_dynamic_volume_label() {
     };
     let driver_default = Arc::new(UcloudFsDriver::new(deps_default));
     assert_eq!(driver_default.get_volume_label(), "ucloud");
+}
+
+#[tokio::test]
+async fn test_cached_byte_source_fetch_range_delayed_non_zero_fidelity() {
+    use bytes::Bytes;
+    use dashmap::DashMap;
+    use std::time::Duration;
+    use ucloud_fs::stream::read_window::{BoxFuture, ByteSource};
+    use ucloud_fs::vfs::driver::{CachedByteSource, SharedBlockCache};
+
+    struct LatencyByteSource {
+        data: Vec<u8>,
+        latency: Duration,
+    }
+
+    impl ByteSource for LatencyByteSource {
+        fn file_size(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn fetch_range<'a>(&'a self, start: u64, end: u64) -> BoxFuture<'a, Result<Bytes, VfsError>> {
+            Box::pin(async move {
+                tokio::time::sleep(self.latency).await;
+                let s = start as usize;
+                let e = (end as usize + 1).min(self.data.len());
+                if s >= self.data.len() || s >= e {
+                    return Ok(Bytes::new());
+                }
+                Ok(Bytes::copy_from_slice(&self.data[s..e]))
+            })
+        }
+    }
+
+    // 2 MB of non-zero pseudorandom bytes
+    let size = 2 * 1024 * 1024;
+    let data: Vec<u8> = (0..size).map(|i| ((i % 250) + 1) as u8).collect();
+    let byte_source = Arc::new(LatencyByteSource {
+        data: data.clone(),
+        latency: Duration::from_millis(80), // > 50ms to exceed old timeout
+    });
+
+    let shared_cache = Arc::new(SharedBlockCache::new(32));
+    let hot_header_cache = Arc::new(DashMap::new());
+    let source = Arc::new(CachedByteSource::new(
+        999,
+        size as u64,
+        byte_source,
+        shared_cache,
+        hot_header_cache,
+        tokio::runtime::Handle::current(),
+    ));
+
+    // Read range across block 1 (from 600 KB, length 128 KB)
+    // which has an 80ms network latency
+    let offset = 600 * 1024;
+    let length = 128 * 1024;
+    let fetched = source.fetch_range(offset, length).await.expect("fetch_range must succeed");
+
+    assert_eq!(fetched.len(), length);
+    // Verify 100% genuine bytes (zero fake zeroes)
+    assert_eq!(&fetched[..], &data[offset as usize..(offset as usize + length)]);
+    assert!(fetched.iter().all(|&b| b != 0), "All bytes must be genuine non-zero bytes");
 }

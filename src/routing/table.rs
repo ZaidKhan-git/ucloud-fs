@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use tracing::{debug, info};
@@ -169,6 +170,22 @@ impl InMemoryRoutingTable {
             Some(e) => format!("{stem} {suffix}.{e}"),
             None => format!("{stem} {suffix}"),
         }
+    }
+
+    /// Formats a folder name with an account abbreviation:
+    /// e.g. "JaipurTrip2024", "mohdzaidk035@gmail.com" -> "JaipurTrip2024 (mohdzaidk035)"
+    #[must_use]
+    pub fn format_folder_disambiguated(name: &str, account_id: &str) -> String {
+        let abbr = Self::account_abbreviation(account_id);
+        format!("{name} ({abbr})")
+    }
+
+    /// Formats a filename with an account abbreviation:
+    /// e.g. "itinerary.pdf", "mohdzaidk035@gmail.com" -> "itinerary (mohdzaidk035).pdf"
+    #[must_use]
+    pub fn format_disambiguated(name: &str, account_id: &str) -> String {
+        let abbr = Self::account_abbreviation(account_id);
+        Self::format_disambiguated_name(name, &abbr, 1)
     }
 
     /// Returns the preferred account for an inode.
@@ -569,6 +586,225 @@ impl InMemoryRoutingTable {
         Some(*guard.value())
     }
 
+    /// Looks up an inode by its cloud account ID and Google file ID.
+    /// Public alias for `lookup_by_cloud_id`.
+    #[must_use]
+    pub fn get_ino_by_cloud_id(&self, account_id: &str, google_file_id: &str) -> Option<u64> {
+        self.lookup_by_cloud_id(account_id, google_file_id)
+    }
+
+    /// Updates an existing directory inode across delta sync changes, preserving collision disambiguation.
+    ///
+    /// Follows strict Single-Guard discipline to avoid deadlocks.
+    pub fn update_existing_directory(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_remote_name: &str,
+        mtime: u64,
+    ) -> Option<String> {
+        let (old_parent_ino, old_name) = {
+            let node = self.inodes.get(&ino)?;
+            (node.parent_ino, node.name.clone())
+        };
+
+        let account_id = self
+            .virtual_folders
+            .get(&ino)
+            .and_then(|guard| guard.value().keys().next().cloned())
+            .unwrap_or_else(|| "cloud".to_string());
+
+        let base_lookup_key = canonical_lookup_key(new_remote_name);
+        let base_key = (new_parent_ino, base_lookup_key.clone());
+
+        let effective_display_name = if self.collided_dirs.contains_key(&base_key) {
+            Self::format_folder_disambiguated(new_remote_name, &account_id)
+        } else {
+            let other_ino = self.lookup_by_name.get(&base_key).map(|g| *g.value());
+            if let Some(other_ino) = other_ino
+                && other_ino != ino
+            {
+                let other_acc = self
+                    .virtual_folders
+                    .get(&other_ino)
+                    .and_then(|g| g.value().keys().next().cloned());
+
+                if let Some(other_acc) = other_acc
+                    && other_acc != account_id
+                {
+                    self.collided_dirs
+                        .insert(base_key.clone(), new_remote_name.to_string());
+
+                    let other_disambiguated =
+                        Self::format_folder_disambiguated(new_remote_name, &other_acc);
+
+                    self.lookup_by_name.remove(&base_key);
+                    self.lookup_by_name.insert(
+                        (new_parent_ino, canonical_lookup_key(&other_disambiguated)),
+                        other_ino,
+                    );
+                    if let Some(mut other_node) = self.inodes.get_mut(&other_ino) {
+                        other_node.name = other_disambiguated;
+                    }
+
+                    Self::format_folder_disambiguated(new_remote_name, &account_id)
+                } else {
+                    new_remote_name.to_string()
+                }
+            } else {
+                new_remote_name.to_string()
+            }
+        };
+
+        if old_name != effective_display_name || old_parent_ino != new_parent_ino {
+            let old_lookup_key = (old_parent_ino, canonical_lookup_key(&old_name));
+            self.lookup_by_name.remove(&old_lookup_key);
+            let new_lookup_key = (
+                new_parent_ino,
+                canonical_lookup_key(&effective_display_name),
+            );
+            self.lookup_by_name.insert(new_lookup_key, ino);
+
+            if old_parent_ino != new_parent_ino {
+                if let Some(mut old_parent) = self.inodes.get_mut(&old_parent_ino) {
+                    old_parent.children.retain(|&cid| cid != ino);
+                }
+                if let Some(mut new_parent) = self.inodes.get_mut(&new_parent_ino)
+                    && !new_parent.children.contains(&ino)
+                {
+                    new_parent.children.push(ino);
+                }
+            }
+
+            if let Some(mut node) = self.inodes.get_mut(&ino) {
+                node.parent_ino = new_parent_ino;
+                node.name = effective_display_name.clone();
+                if mtime > 0 {
+                    node.modified_time = mtime;
+                }
+            }
+        } else if mtime > 0
+            && let Some(mut node) = self.inodes.get_mut(&ino)
+        {
+            node.modified_time = mtime;
+        }
+
+        Some(effective_display_name)
+    }
+
+    /// Updates an existing file inode across delta sync changes, preserving collision disambiguation.
+    ///
+    /// Follows strict Single-Guard discipline to avoid deadlocks.
+    pub fn update_existing_file(
+        &self,
+        ino: u64,
+        new_parent_ino: u64,
+        new_remote_name: &str,
+        size: u64,
+        mtime: u64,
+    ) -> Option<String> {
+        let (old_parent_ino, old_name, account_id) = {
+            let node = self.inodes.get(&ino)?;
+            let acc = match &node.location {
+                StorageLocation::SingleAccount { account_id, .. } => account_id.clone(),
+                StorageLocation::StripedManifest {
+                    manifest_account_id,
+                    ..
+                } => manifest_account_id.clone(),
+                _ => "cloud".to_string(),
+            };
+            (node.parent_ino, node.name.clone(), acc)
+        };
+
+        let base_lookup_key = canonical_lookup_key(new_remote_name);
+        let base_key = (new_parent_ino, base_lookup_key.clone());
+
+        let effective_display_name = if self.collided_files.contains_key(&base_key) {
+            Self::format_disambiguated(new_remote_name, &account_id)
+        } else {
+            let other_ino = self.lookup_by_name.get(&base_key).map(|g| *g.value());
+            if let Some(other_ino) = other_ino
+                && other_ino != ino
+            {
+                let other_acc = self
+                    .inodes
+                    .get(&other_ino)
+                    .and_then(|node| match &node.location {
+                        StorageLocation::SingleAccount { account_id, .. } => {
+                            Some(account_id.clone())
+                        }
+                        StorageLocation::StripedManifest {
+                            manifest_account_id,
+                            ..
+                        } => Some(manifest_account_id.clone()),
+                        _ => None,
+                    });
+
+                if let Some(other_acc) = other_acc
+                    && other_acc != account_id
+                {
+                    self.collided_files
+                        .insert(base_key.clone(), new_remote_name.to_string());
+
+                    let other_disambiguated =
+                        Self::format_disambiguated(new_remote_name, &other_acc);
+
+                    self.lookup_by_name.remove(&base_key);
+                    self.lookup_by_name.insert(
+                        (new_parent_ino, canonical_lookup_key(&other_disambiguated)),
+                        other_ino,
+                    );
+                    if let Some(mut other_node) = self.inodes.get_mut(&other_ino) {
+                        other_node.name = other_disambiguated;
+                    }
+
+                    Self::format_disambiguated(new_remote_name, &account_id)
+                } else {
+                    new_remote_name.to_string()
+                }
+            } else {
+                new_remote_name.to_string()
+            }
+        };
+
+        if old_name != effective_display_name || old_parent_ino != new_parent_ino {
+            let old_lookup_key = (old_parent_ino, canonical_lookup_key(&old_name));
+            self.lookup_by_name.remove(&old_lookup_key);
+            let new_lookup_key = (
+                new_parent_ino,
+                canonical_lookup_key(&effective_display_name),
+            );
+            self.lookup_by_name.insert(new_lookup_key, ino);
+
+            if old_parent_ino != new_parent_ino {
+                if let Some(mut old_parent) = self.inodes.get_mut(&old_parent_ino) {
+                    old_parent.children.retain(|&cid| cid != ino);
+                }
+                if let Some(mut new_parent) = self.inodes.get_mut(&new_parent_ino)
+                    && !new_parent.children.contains(&ino)
+                {
+                    new_parent.children.push(ino);
+                }
+            }
+
+            if let Some(mut node) = self.inodes.get_mut(&ino) {
+                node.parent_ino = new_parent_ino;
+                node.name = effective_display_name.clone();
+                node.size = size;
+                if mtime > 0 {
+                    node.modified_time = mtime;
+                }
+            }
+        } else if let Some(mut node) = self.inodes.get_mut(&ino) {
+            node.size = size;
+            if mtime > 0 {
+                node.modified_time = mtime;
+            }
+        }
+
+        Some(effective_display_name)
+    }
+
     /// Registers a chunk's cloud ID so remote deletion of individual chunks maps to the parent striped file inode.
     pub fn register_chunk_cloud_id(&self, account_id: &str, google_file_id: &str, striped_ino: u64) {
         self.reverse_cloud_index
@@ -707,67 +943,117 @@ impl InMemoryRoutingTable {
             }
         }
 
-        // 2. Map Google folder IDs to in-memory InodeIds:
-        // Google Root folder -> ROOT_INO (1)
-        let mut google_to_ino: HashMap<String, u64> = HashMap::new();
+        // 2. Precompute total set of fetched folder IDs
+        let fetched_folder_ids: HashSet<&str> = folders
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
 
-        // 3. Insert and merge directories hierarchically
-        // Repeat iterations until all parent references resolve (handles unordered files.list)
-        let mut remaining_folders = folders;
-        let mut iterations = 0;
-        while !remaining_folders.is_empty() && iterations < 50 {
-            let prev_len = remaining_folders.len();
-            let mut unplaced = Vec::new();
-            for folder in remaining_folders {
-                let parent_google_id = folder.parents.as_ref().and_then(|p| p.first()).map(|s| s.as_str());
-
-                let parent_ino = match parent_google_id {
-                    None | Some("root") => Self::ROOT_INO,
-                    Some(pid) => match google_to_ino.get(pid) {
-                        Some(&ino) => ino,
-                        None => {
-                            unplaced.push(folder);
-                            continue;
-                        }
-                    },
-                };
-
-                let dir_ino = self.insert_or_merge_directory(
-                    parent_ino,
-                    &folder.name,
-                    Some(&data.account_id),
-                    Some(&folder.id),
-                )?;
-                google_to_ino.insert(folder.id.clone(), dir_ino);
-            }
-
-            if unplaced.len() == prev_len {
-                // Orphaned folders without reachable parent -> place under ROOT_INO
-                for f in unplaced {
-                    let dir_ino = self.insert_or_merge_directory(
-                        Self::ROOT_INO,
-                        &f.name,
-                        Some(&data.account_id),
-                        Some(&f.id),
-                    )?;
-                    google_to_ino.insert(f.id.clone(), dir_ino);
-                }
+        // 3. Multi-pass topological loop (up to 16 passes) over pending folders
+        let mut pending_folders = folders;
+        for _pass in 0..16 {
+            if pending_folders.is_empty() {
                 break;
             }
 
-            remaining_folders = unplaced;
-            iterations += 1;
+            let prev_count = pending_folders.len();
+            let mut next_pending = Vec::new();
+
+            for folder in pending_folders {
+                let target_parent_ino = if folder
+                    .parents
+                    .as_ref()
+                    .is_none_or(|p| p.is_empty() || p.iter().any(|s| s == "root"))
+                {
+                    // Condition 1: parents list is empty, OR
+                    // Condition 2: parents contains "root"
+                    Some(Self::ROOT_INO)
+                } else {
+                    let parent_id = folder
+                        .parents
+                        .as_ref()
+                        .and_then(|p| p.first())
+                        .map(|s| s.as_str());
+
+                    match parent_id {
+                        None | Some("root") => Some(Self::ROOT_INO),
+                        Some(pid) => {
+                            if let Some(parent_ino) = self.get_ino_by_cloud_id(&data.account_id, pid) {
+                                // Condition 3: parent google_file_id is already registered
+                                Some(parent_ino)
+                            } else if !fetched_folder_ids.contains(pid) {
+                                // Condition 4: parent google_file_id is NOT in fetched_folder_ids
+                                Some(Self::ROOT_INO)
+                            } else {
+                                // Parent is in fetched_folder_ids but not yet registered -> defer to next pass
+                                None
+                            }
+                        }
+                    }
+                };
+
+                match target_parent_ino {
+                    Some(parent_ino) => {
+                        self.insert_or_merge_directory(
+                            parent_ino,
+                            &folder.name,
+                            Some(&data.account_id),
+                            Some(&folder.id),
+                        )?;
+                    }
+                    None => {
+                        next_pending.push(folder);
+                    }
+                }
+            }
+
+            // Deadlock / Cycle Detection: if no folders could be placed in this pass
+            let made_progress = next_pending.len() < prev_count;
+            pending_folders = next_pending;
+            if !made_progress {
+                break;
+            }
+        }
+
+        // Safety fallback: if unplaced folders remain after 16 passes (e.g. cycle),
+        // insert them under ROOT_INO
+        for folder in pending_folders {
+            let _ = self.insert_or_merge_directory(
+                Self::ROOT_INO,
+                &folder.name,
+                Some(&data.account_id),
+                Some(&folder.id),
+            );
         }
 
         // 4. Insert files under resolved parent inodes
         for file in files {
-            let parent_google_id = file.parents.as_ref().and_then(|p| p.first()).map(|s| s.as_str());
-            let parent_ino = match parent_google_id {
-                None | Some("root") => Self::ROOT_INO,
-                Some(pid) => google_to_ino.get(pid).copied().unwrap_or(Self::ROOT_INO),
+            let parent_ino = if file
+                .parents
+                .as_ref()
+                .is_none_or(|p| p.is_empty() || p.iter().any(|s| s == "root"))
+            {
+                Self::ROOT_INO
+            } else {
+                let parent_google_id = file
+                    .parents
+                    .as_ref()
+                    .and_then(|p| p.first())
+                    .map(|s| s.as_str());
+
+                match parent_google_id {
+                    None | Some("root") => Self::ROOT_INO,
+                    Some(pid) => self
+                        .get_ino_by_cloud_id(&data.account_id, pid)
+                        .unwrap_or(Self::ROOT_INO),
+                }
             };
 
-            let size = file.size.as_ref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let size = file
+                .size
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
             let location = StorageLocation::SingleAccount {
                 account_id: data.account_id.clone(),
                 google_file_id: file.id.clone(),
@@ -786,6 +1072,12 @@ impl InMemoryRoutingTable {
         }
 
         Ok(())
+    }
+
+    /// Hydrates file and folder trees from a linked Google account into the in-memory graph.
+    /// Alias for `hydrate_account_data`.
+    pub fn hydrate_account_into_table(&self, data: &HydratedAccountData) -> Result<(), VfsError> {
+        self.hydrate_account_data(data)
     }
 
     /// Wipes all in-memory tables and resets the state to root `/` (called on logout / session lock).
@@ -819,6 +1111,14 @@ impl Default for InMemoryRoutingTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Helper wrapper function to hydrate account data into an `Arc<InMemoryRoutingTable>`.
+pub fn hydrate_account_into_table(
+    routing_table: &Arc<InMemoryRoutingTable>,
+    data: &HydratedAccountData,
+) -> Result<(), VfsError> {
+    routing_table.hydrate_account_data(data)
 }
 
 #[cfg(test)]
